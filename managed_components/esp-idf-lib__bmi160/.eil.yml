@@ -1,0 +1,30 @@
+---
+name: bmi160
+description: A template for esp-idf-lib component
+version: 1.0.2
+groups:
+  - common
+code_owners:
+  - trombik
+  - lukbieli
+depends:
+  - freertos
+thread_safe: n/a
+targets:
+  - esp32
+  - esp32c2
+  - esp32c3
+  - esp32c5
+  - esp32c6
+  - esp32c61
+  - esp32h2
+  - esp32p4
+  - esp32s2
+  - esp32s3
+  - esp8266
+license: ISC
+copyrights:
+  - name: trombik
+    year: 2025
+  - name: lukbieli
+    year: 2025
