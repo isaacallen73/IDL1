@@ -32,7 +32,7 @@ extern "C" {
 #endif
 
 #define BMI160_I2C_ADDRESS_GND 0x68u ///< I2C address of BMI160 if SDO is pulled to GND
-#define BMI160_I2C_ADDRESS_VDD 0x55u ///< I2C address of BMI160 if SDO is pulled to VDDIO
+#define BMI160_I2C_ADDRESS_VDD 0x69u ///< I2C address of BMI160 if SDO is pulled to VDDIO
 
 /**
  * @brief enum for the accelerometer range

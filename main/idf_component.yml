@@ -16,4 +16,3 @@ dependencies:
   #   public: true
   esp-idf-lib/bmi160: ^1.0.2
   esp-idf-lib/i2cdev: ^2.0.8
-  esp-idf-lib/tca9548: '*'
