@@ -4,6 +4,7 @@
 #define ENABLE_I2C_SENSORS    // Enable I2C multiplexer and BMI160 IMU
 #define ENABLE_GPS            // Enable GPS module
 #define ENABLE_SD_CARD        // Enable SD card logging
+#define ENABLE_BLUETOOTH      // Enable BLE data streaming to Android
 
 // ============================================================================
 // Common includes
@@ -11,6 +12,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdbool.h>
+#include <errno.h>
 #include <esp_err.h>
 #include <esp_log.h>
 #include <esp_system.h>
@@ -119,6 +121,57 @@ void sd_close_data_log(void);      // Close and flush data log
 esp_err_t sd_log_imu_batch(imu_sample_t *samples, size_t count);  // Fast binary write
 #endif
 #endif
+
+// ============================================================================
+// Bluetooth BLE configuration
+// ============================================================================
+#ifdef ENABLE_BLUETOOTH
+#include "nvs_flash.h"
+#include "esp_bt.h"
+#include "esp_gap_ble_api.h"
+#include "esp_gatts_api.h"
+#include "esp_bt_main.h"
+#include "esp_gatt_common_api.h"
+
+// BLE Service and Characteristic UUIDs
+// Custom 128-bit UUIDs for our datalogger service
+#define GATTS_SERVICE_UUID_DATALOGGER   0x00FF
+#define GATTS_CHAR_UUID_IMU_DATA        0xFF01
+#define GATTS_CHAR_UUID_GPS_DATA        0xFF02
+
+// GATT Server Configuration
+#define GATTS_NUM_HANDLE                8
+#define GATTS_DEMO_CHAR_VAL_LEN_MAX     512
+#define PREPARE_BUF_MAX_SIZE            1024
+#define DEVICE_NAME                     "ESP32-Datalogger"
+#define GATTS_TAG                       "BLE_GATTS"
+
+// BLE Profile IDs
+#define PROFILE_NUM                     1
+#define PROFILE_APP_IDX                 0
+#define APP_ID                          0x55
+
+// MTU size - negotiated with client (23-512 bytes)
+#define BLE_MTU_SIZE                    512
+
+// Global BLE state variables
+static uint16_t ble_conn_id = 0xFFFF;  // Connection ID (0xFFFF = not connected)
+static uint16_t ble_gatts_if = 0xFF;   // GATT server interface
+static bool ble_is_connected = false;
+static uint16_t ble_mtu = 23;          // Current MTU (starts at minimum)
+
+// Characteristic handles
+static uint16_t imu_data_handle = 0;
+static uint16_t gps_data_handle = 0;
+
+// Forward declarations for BLE functions
+static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param);
+static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param);
+esp_err_t ble_init(void);
+esp_err_t ble_send_imu_batch(imu_sample_t *samples, size_t count);
+esp_err_t ble_send_gps_data(const char *nmea_sentence);
+
+#endif // ENABLE_BLUETOOTH
 
 static const char *TAG = "DATALOGGER";
 
@@ -264,8 +317,9 @@ void data_writer_task(void *pvParameters)
             // Add to batch buffer
             batch_buffer[batch_count++] = sample;
 
-            // When batch is full, write to SD card
+            // When batch is full, write to SD card and/or send over BLE
             if (batch_count >= IMU_BATCH_SIZE) {
+#ifdef ENABLE_SD_CARD
                 if (sd_card != NULL && data_log_file != NULL) {
                     esp_err_t ret = sd_log_imu_batch(batch_buffer, batch_count);
                     if (ret == ESP_OK) {
@@ -274,15 +328,25 @@ void data_writer_task(void *pvParameters)
                     } else {
                         ESP_LOGW(TAG, "Failed to write IMU batch to SD card");
                     }
-                } else {
-                    ESP_LOGW(TAG, "SD card not available - %d samples discarded", batch_count);
                 }
+#endif
+
+#ifdef ENABLE_BLUETOOTH
+                // Send over BLE if connected
+                esp_err_t ble_ret = ble_send_imu_batch(batch_buffer, batch_count);
+                if (ble_ret == ESP_OK) {
+                    ESP_LOGI(TAG, "Sent %d samples over BLE", batch_count);
+                } else if (ble_is_connected) {
+                    ESP_LOGW(TAG, "Failed to send IMU batch over BLE");
+                }
+#endif
 
                 batch_count = 0;  // Reset batch
             }
         } else {
             // Timeout - write partial batch if any
             if (batch_count > 0) {
+#ifdef ENABLE_SD_CARD
                 if (sd_card != NULL && data_log_file != NULL) {
                     esp_err_t ret = sd_log_imu_batch(batch_buffer, batch_count);
                     if (ret == ESP_OK) {
@@ -290,6 +354,15 @@ void data_writer_task(void *pvParameters)
                         ESP_LOGI(TAG, "Wrote partial batch: %d samples (total: %lu)", batch_count, total_written);
                     }
                 }
+#endif
+
+#ifdef ENABLE_BLUETOOTH
+                // Send partial batch over BLE if connected
+                esp_err_t ble_ret = ble_send_imu_batch(batch_buffer, batch_count);
+                if (ble_ret == ESP_OK) {
+                    ESP_LOGI(TAG, "Sent partial batch: %d samples over BLE", batch_count);
+                }
+#endif
 
                 batch_count = 0;
             }
@@ -358,6 +431,15 @@ void gps_task(void *pvParameters)
                 }
             }
 #endif
+
+            // Send over BLE if enabled and connected
+#ifdef ENABLE_BLUETOOTH
+            esp_err_t ble_ret = ble_send_gps_data((char*)data);
+            if (ble_ret != ESP_OK && ble_is_connected) {
+                ESP_LOGW(TAG, "Failed to send GPS data over BLE");
+            }
+#endif
+
             no_data_count = 0;  // Reset counter
         } else {
             no_data_count++;
@@ -512,14 +594,28 @@ esp_err_t sd_open_data_log(void)
     char filepath[64];
     snprintf(filepath, sizeof(filepath), "%s/sensor_data.bin", SD_MOUNT_POINT);
 
-    // Open in binary append mode ("ab") - file stays open
-    data_log_file = fopen(filepath, "ab");
+    // Try opening with "ab+" which creates the file if it doesn't exist
+    // "ab+" = append binary mode, create if doesn't exist
+    data_log_file = fopen(filepath, "ab+");
     if (data_log_file == NULL) {
         ESP_LOGE(TAG, "Failed to open data log file: %s", filepath);
+        ESP_LOGE(TAG, "errno=%d (%s)", errno, strerror(errno));
+
+        // Try listing the directory to verify mount point
+        ESP_LOGI(TAG, "Attempting to verify SD card is writable...");
+        FILE *test = fopen("/sdcard/test.txt", "w");
+        if (test == NULL) {
+            ESP_LOGE(TAG, "SD card is not writable! errno=%d (%s)", errno, strerror(errno));
+            return ESP_FAIL;
+        }
+        fclose(test);
+        remove("/sdcard/test.txt");
+        ESP_LOGI(TAG, "SD card is writable, but binary file creation failed");
+
         return ESP_FAIL;
     }
 
-    // Disable buffering for immediate writes (or use setvbuf for custom buffer)
+    // Disable buffering for immediate writes
     setbuf(data_log_file, NULL);  // Unbuffered for lowest latency
 
     ESP_LOGI(TAG, "Opened binary data log: %s", filepath);
@@ -563,6 +659,429 @@ esp_err_t sd_log_imu_batch(imu_sample_t *samples, size_t count)
 #endif // ENABLE_SD_CARD
 
 // ============================================================================
+// BLUETOOTH BLE CODE
+// ============================================================================
+#ifdef ENABLE_BLUETOOTH
+
+// Extended Advertising (BLE 5.0) configuration
+#define EXT_ADV_HANDLE  0
+#define NUM_EXT_ADV     1
+
+static uint8_t adv_service_uuid[16] = {
+    0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80,
+    0x00, 0x10, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00,
+};
+
+// Extended advertising parameters (BLE 5.0)
+static esp_ble_gap_ext_adv_params_t ext_adv_params = {
+    .type = ESP_BLE_GAP_SET_EXT_ADV_PROP_CONNECTABLE,
+    .interval_min = 0x20,  // 20ms (units of 0.625ms)
+    .interval_max = 0x40,  // 40ms
+    .channel_map = ADV_CHNL_ALL,
+    .own_addr_type = BLE_ADDR_TYPE_PUBLIC,
+    .filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
+    .primary_phy = ESP_BLE_GAP_PHY_1M,
+    .max_skip = 0,
+    .secondary_phy = ESP_BLE_GAP_PHY_1M,
+    .sid = 0,
+    .scan_req_notif = false,
+};
+
+// GATT Profile Structure
+struct gatts_profile_inst {
+    esp_gatts_cb_t gatts_cb;
+    uint16_t gatts_if;
+    uint16_t app_id;
+    uint16_t conn_id;
+    uint16_t service_handle;
+    esp_gatt_srvc_id_t service_id;
+    uint16_t imu_char_handle;
+    uint16_t gps_char_handle;
+    esp_bt_uuid_t imu_char_uuid;
+    esp_bt_uuid_t gps_char_uuid;
+    esp_gatt_perm_t perm;
+    esp_gatt_char_prop_t property;
+    uint16_t descr_handle;
+    esp_bt_uuid_t descr_uuid;
+};
+
+static struct gatts_profile_inst gl_profile = {
+    .gatts_cb = gatts_profile_event_handler,
+    .gatts_if = ESP_GATT_IF_NONE,
+};
+
+// GAP Event Handler (BLE 5.0 Extended Advertising)
+static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
+{
+    switch (event) {
+        case ESP_GAP_BLE_EXT_ADV_SET_PARAMS_COMPLETE_EVT:
+            ESP_LOGI(GATTS_TAG, "Extended advertising params set, status=%d", param->ext_adv_set_params.status);
+            // Set device name
+            esp_ble_gap_set_device_name(DEVICE_NAME);
+
+            // Set extended advertising data
+            esp_ble_gap_config_ext_adv_data_raw(EXT_ADV_HANDLE, sizeof(adv_service_uuid), adv_service_uuid);
+            break;
+
+        case ESP_GAP_BLE_EXT_ADV_DATA_SET_COMPLETE_EVT:
+            ESP_LOGI(GATTS_TAG, "Extended advertising data set, status=%d", param->ext_adv_data_set.status);
+            // Now start advertising
+            esp_ble_gap_ext_adv_start(NUM_EXT_ADV, &(esp_ble_gap_ext_adv_t){.instance = EXT_ADV_HANDLE, .duration = 0, .max_events = 0});
+            break;
+
+        case ESP_GAP_BLE_EXT_ADV_START_COMPLETE_EVT:
+            if (param->ext_adv_start.status != ESP_BT_STATUS_SUCCESS) {
+                ESP_LOGE(GATTS_TAG, "Extended advertising start failed, status=%d", param->ext_adv_start.status);
+            } else {
+                ESP_LOGI(GATTS_TAG, "Extended advertising started successfully");
+            }
+            break;
+
+        case ESP_GAP_BLE_EXT_ADV_STOP_COMPLETE_EVT:
+            if (param->ext_adv_stop.status != ESP_BT_STATUS_SUCCESS) {
+                ESP_LOGE(GATTS_TAG, "Extended advertising stop failed");
+            } else {
+                ESP_LOGI(GATTS_TAG, "Extended advertising stopped");
+            }
+            break;
+
+        case ESP_GAP_BLE_UPDATE_CONN_PARAMS_EVT:
+            ESP_LOGI(GATTS_TAG, "Connection params updated: status=%d", param->update_conn_params.status);
+            break;
+
+        default:
+            break;
+    }
+}
+
+// GATT Server Event Handler
+static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param)
+{
+    switch (event) {
+        case ESP_GATTS_REG_EVT:
+            ESP_LOGI(GATTS_TAG, "GATT server registered, status=%d, app_id=%d", param->reg.status, param->reg.app_id);
+
+            gl_profile.service_id.is_primary = true;
+            gl_profile.service_id.id.inst_id = 0x00;
+            gl_profile.service_id.id.uuid.len = ESP_UUID_LEN_16;
+            gl_profile.service_id.id.uuid.uuid.uuid16 = GATTS_SERVICE_UUID_DATALOGGER;
+
+            // Configure extended advertising (BLE 5.0)
+            esp_ble_gap_ext_adv_set_params(EXT_ADV_HANDLE, &ext_adv_params);
+
+            esp_ble_gatts_create_service(gatts_if, &gl_profile.service_id, GATTS_NUM_HANDLE);
+            break;
+
+        case ESP_GATTS_CREATE_EVT:
+            ESP_LOGI(GATTS_TAG, "Service created, status=%d, service_handle=%d", param->create.status, param->create.service_handle);
+            gl_profile.service_handle = param->create.service_handle;
+
+            // Create IMU data characteristic
+            gl_profile.imu_char_uuid.len = ESP_UUID_LEN_16;
+            gl_profile.imu_char_uuid.uuid.uuid16 = GATTS_CHAR_UUID_IMU_DATA;
+
+            esp_ble_gatts_start_service(gl_profile.service_handle);
+
+            esp_gatt_char_prop_t imu_property = ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_NOTIFY;
+            esp_err_t add_char_ret = esp_ble_gatts_add_char(gl_profile.service_handle, &gl_profile.imu_char_uuid,
+                                                             ESP_GATT_PERM_READ,
+                                                             imu_property,
+                                                             NULL, NULL);
+            if (add_char_ret) {
+                ESP_LOGE(GATTS_TAG, "Add IMU char failed, error code=%x", add_char_ret);
+            }
+            break;
+
+        case ESP_GATTS_ADD_CHAR_EVT:
+            ESP_LOGI(GATTS_TAG, "Characteristic added, status=%d, attr_handle=%d, service_handle=%d",
+                     param->add_char.status, param->add_char.attr_handle, param->add_char.service_handle);
+
+            // Store the characteristic handle based on UUID
+            if (param->add_char.char_uuid.uuid.uuid16 == GATTS_CHAR_UUID_IMU_DATA) {
+                imu_data_handle = param->add_char.attr_handle;
+                ESP_LOGI(GATTS_TAG, "IMU data handle: %d", imu_data_handle);
+
+                // Add CCCD (Client Characteristic Configuration Descriptor) for IMU notifications
+                esp_bt_uuid_t cccd_uuid;
+                cccd_uuid.len = ESP_UUID_LEN_16;
+                cccd_uuid.uuid.uuid16 = ESP_GATT_UUID_CHAR_CLIENT_CONFIG;
+
+                uint8_t cccd_init_value[2] = {0x00, 0x00};
+                esp_attr_value_t cccd_val = {
+                    .attr_max_len = sizeof(cccd_init_value),
+                    .attr_len = sizeof(cccd_init_value),
+                    .attr_value = cccd_init_value
+                };
+                esp_ble_gatts_add_char_descr(gl_profile.service_handle, &cccd_uuid,
+                                               ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
+                                               &cccd_val, NULL);
+            } else if (param->add_char.char_uuid.uuid.uuid16 == GATTS_CHAR_UUID_GPS_DATA) {
+                gps_data_handle = param->add_char.attr_handle;
+                ESP_LOGI(GATTS_TAG, "GPS data handle: %d", gps_data_handle);
+
+                // Add CCCD for GPS notifications
+                esp_bt_uuid_t cccd_uuid;
+                cccd_uuid.len = ESP_UUID_LEN_16;
+                cccd_uuid.uuid.uuid16 = ESP_GATT_UUID_CHAR_CLIENT_CONFIG;
+
+                uint8_t cccd_init_value[2] = {0x00, 0x00};
+                esp_attr_value_t cccd_val = {
+                    .attr_max_len = sizeof(cccd_init_value),
+                    .attr_len = sizeof(cccd_init_value),
+                    .attr_value = cccd_init_value
+                };
+                esp_ble_gatts_add_char_descr(gl_profile.service_handle, &cccd_uuid,
+                                               ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
+                                               &cccd_val, NULL);
+            }
+            break;
+
+        case ESP_GATTS_ADD_CHAR_DESCR_EVT:
+            ESP_LOGI(GATTS_TAG, "Descriptor added, status=%d", param->add_char_descr.status);
+
+            // After IMU descriptor is added, add GPS characteristic
+            if (gps_data_handle == 0) {
+                gl_profile.gps_char_uuid.len = ESP_UUID_LEN_16;
+                gl_profile.gps_char_uuid.uuid.uuid16 = GATTS_CHAR_UUID_GPS_DATA;
+
+                esp_gatt_char_prop_t gps_property = ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_NOTIFY;
+                esp_err_t add_gps_ret = esp_ble_gatts_add_char(gl_profile.service_handle, &gl_profile.gps_char_uuid,
+                                                                 ESP_GATT_PERM_READ,
+                                                                 gps_property,
+                                                                 NULL, NULL);
+                if (add_gps_ret) {
+                    ESP_LOGE(GATTS_TAG, "Add GPS char failed, error code=%x", add_gps_ret);
+                }
+            }
+            break;
+
+        case ESP_GATTS_CONNECT_EVT:
+            ESP_LOGI(GATTS_TAG, "Client connected, conn_id=%d, remote " ESP_BD_ADDR_STR,
+                     param->connect.conn_id,
+                     ESP_BD_ADDR_HEX(param->connect.remote_bda));
+
+            ble_conn_id = param->connect.conn_id;
+            ble_gatts_if = gatts_if;
+            ble_is_connected = true;
+
+            // Request MTU exchange
+            esp_ble_gatt_set_local_mtu(BLE_MTU_SIZE);
+            esp_ble_gatts_send_indicate(gatts_if, param->connect.conn_id, imu_data_handle, 0, NULL, false);
+
+            // Update connection parameters for high throughput
+            esp_ble_conn_update_params_t conn_params = {0};
+            memcpy(conn_params.bda, param->connect.remote_bda, sizeof(esp_bd_addr_t));
+            conn_params.latency = 0;
+            conn_params.max_int = 0x10;    // 20ms
+            conn_params.min_int = 0x06;    // 7.5ms
+            conn_params.timeout = 400;     // 4s
+            esp_ble_gap_update_conn_params(&conn_params);
+            break;
+
+        case ESP_GATTS_DISCONNECT_EVT:
+            ESP_LOGI(GATTS_TAG, "Client disconnected, reason=0x%x", param->disconnect.reason);
+            ble_is_connected = false;
+            ble_conn_id = 0xFFFF;
+            ble_mtu = 23;  // Reset to minimum
+
+            // Restart extended advertising
+            esp_ble_gap_ext_adv_start(NUM_EXT_ADV, &(esp_ble_gap_ext_adv_t){.instance = EXT_ADV_HANDLE, .duration = 0, .max_events = 0});
+            break;
+
+        case ESP_GATTS_MTU_EVT:
+            ESP_LOGI(GATTS_TAG, "MTU exchange complete, MTU=%d", param->mtu.mtu);
+            ble_mtu = param->mtu.mtu;
+            break;
+
+        case ESP_GATTS_CONF_EVT:
+            // Confirmation received for indication
+            break;
+
+        default:
+            break;
+    }
+}
+
+// Main GATT Server Callback - routes events to profile handlers
+static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param)
+{
+    if (event == ESP_GATTS_REG_EVT) {
+        if (param->reg.status == ESP_GATT_OK) {
+            gl_profile.gatts_if = gatts_if;
+        } else {
+            ESP_LOGE(GATTS_TAG, "Register app failed, app_id=%04x, status=%d",
+                     param->reg.app_id, param->reg.status);
+            return;
+        }
+    }
+
+    if (gatts_if == ESP_GATT_IF_NONE || gatts_if == gl_profile.gatts_if) {
+        if (gl_profile.gatts_cb) {
+            gl_profile.gatts_cb(event, gatts_if, param);
+        }
+    }
+}
+
+// Send IMU batch data over BLE (fragments into MTU-sized packets)
+esp_err_t ble_send_imu_batch(imu_sample_t *samples, size_t count)
+{
+    if (!ble_is_connected || samples == NULL || count == 0) {
+        return ESP_FAIL;
+    }
+
+    // Calculate total data size
+    size_t total_size = count * sizeof(imu_sample_t);
+    uint8_t *data_ptr = (uint8_t *)samples;
+
+    // MTU overhead: 3 bytes for ATT header
+    size_t usable_mtu = ble_mtu - 3;
+
+    // Fragment and send data
+    size_t sent = 0;
+    while (sent < total_size) {
+        size_t chunk_size = (total_size - sent) > usable_mtu ? usable_mtu : (total_size - sent);
+
+        esp_err_t ret = esp_ble_gatts_send_indicate(ble_gatts_if, ble_conn_id, imu_data_handle,
+                                                      chunk_size, data_ptr + sent, false);
+        if (ret != ESP_OK) {
+            ESP_LOGW(GATTS_TAG, "Failed to send IMU data chunk, error=0x%x", ret);
+            return ret;
+        }
+
+        sent += chunk_size;
+
+        // Small delay to avoid overwhelming the BLE stack (optional, tune as needed)
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+
+    return ESP_OK;
+}
+
+// Send GPS NMEA data over BLE
+esp_err_t ble_send_gps_data(const char *nmea_sentence)
+{
+    if (!ble_is_connected || nmea_sentence == NULL) {
+        return ESP_FAIL;
+    }
+
+    size_t len = strlen(nmea_sentence);
+    if (len == 0) {
+        return ESP_FAIL;
+    }
+
+    // MTU overhead: 3 bytes for ATT header
+    size_t usable_mtu = ble_mtu - 3;
+
+    // Send GPS data (fragment if needed, but NMEA sentences are usually <100 bytes)
+    size_t sent = 0;
+    while (sent < len) {
+        size_t chunk_size = (len - sent) > usable_mtu ? usable_mtu : (len - sent);
+
+        esp_err_t ret = esp_ble_gatts_send_indicate(ble_gatts_if, ble_conn_id, gps_data_handle,
+                                                      chunk_size, (uint8_t *)(nmea_sentence + sent), false);
+        if (ret != ESP_OK) {
+            ESP_LOGW(GATTS_TAG, "Failed to send GPS data, error=0x%x", ret);
+            return ret;
+        }
+
+        sent += chunk_size;
+    }
+
+    return ESP_OK;
+}
+
+// Initialize BLE stack and GATT server
+esp_err_t ble_init(void)
+{
+    ESP_LOGI(GATTS_TAG, "");
+    ESP_LOGI(GATTS_TAG, "╔════════════════════════════════════════════════╗");
+    ESP_LOGI(GATTS_TAG, "║         BLUETOOTH BLE INITIALIZATION           ║");
+    ESP_LOGI(GATTS_TAG, "╚════════════════════════════════════════════════╝");
+    ESP_LOGI(GATTS_TAG, "Device Name: %s", DEVICE_NAME);
+    ESP_LOGI(GATTS_TAG, "Service UUID: 0x%04X", GATTS_SERVICE_UUID_DATALOGGER);
+    ESP_LOGI(GATTS_TAG, "IMU Characteristic UUID: 0x%04X", GATTS_CHAR_UUID_IMU_DATA);
+    ESP_LOGI(GATTS_TAG, "GPS Characteristic UUID: 0x%04X", GATTS_CHAR_UUID_GPS_DATA);
+    ESP_LOGI(GATTS_TAG, "");
+
+    esp_err_t ret;
+
+    // Initialize NVS (required for BLE)
+    ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+    ESP_LOGI(GATTS_TAG, "NVS initialized");
+
+    // Release classic Bluetooth memory (we only need BLE)
+    ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
+
+    // Initialize BT controller
+    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+    ret = esp_bt_controller_init(&bt_cfg);
+    if (ret) {
+        ESP_LOGE(GATTS_TAG, "Initialize BT controller failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    // Enable BLE mode
+    ret = esp_bt_controller_enable(ESP_BT_MODE_BLE);
+    if (ret) {
+        ESP_LOGE(GATTS_TAG, "Enable BT controller failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    ESP_LOGI(GATTS_TAG, "BT controller enabled");
+
+    // Initialize Bluedroid stack
+    ret = esp_bluedroid_init();
+    if (ret) {
+        ESP_LOGE(GATTS_TAG, "Initialize Bluedroid failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = esp_bluedroid_enable();
+    if (ret) {
+        ESP_LOGE(GATTS_TAG, "Enable Bluedroid failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    ESP_LOGI(GATTS_TAG, "Bluedroid stack enabled");
+
+    // Register callbacks
+    ret = esp_ble_gatts_register_callback(gatts_event_handler);
+    if (ret) {
+        ESP_LOGE(GATTS_TAG, "GATTS register callback failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = esp_ble_gap_register_callback(gap_event_handler);
+    if (ret) {
+        ESP_LOGE(GATTS_TAG, "GAP register callback failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    // Register application profile
+    ret = esp_ble_gatts_app_register(APP_ID);
+    if (ret) {
+        ESP_LOGE(GATTS_TAG, "GATTS app register failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    // Set local MTU
+    ret = esp_ble_gatt_set_local_mtu(BLE_MTU_SIZE);
+    if (ret) {
+        ESP_LOGE(GATTS_TAG, "Set local MTU failed: %s", esp_err_to_name(ret));
+    }
+
+    ESP_LOGI(GATTS_TAG, "BLE initialization complete");
+    ESP_LOGI(GATTS_TAG, "");
+
+    return ESP_OK;
+}
+
+#endif // ENABLE_BLUETOOTH
+
+// ============================================================================
 // MAIN APPLICATION
 // ============================================================================
 void app_main(void)
@@ -587,7 +1106,20 @@ void app_main(void)
 #else
     ESP_LOGI(TAG, "  ✗ SD Card Logging (disabled)");
 #endif
+#ifdef ENABLE_BLUETOOTH
+    ESP_LOGI(TAG, "  ✓ Bluetooth BLE (Data Streaming)");
+#else
+    ESP_LOGI(TAG, "  ✗ Bluetooth BLE (disabled)");
+#endif
     ESP_LOGI(TAG, "");
+
+    // Initialize Bluetooth BLE (if enabled)
+#ifdef ENABLE_BLUETOOTH
+    esp_err_t ble_ret = ble_init();
+    if (ble_ret != ESP_OK) {
+        ESP_LOGW(TAG, "BLE initialization failed - continuing without Bluetooth");
+    }
+#endif
 
     // Initialize SD card (if enabled)
 #ifdef ENABLE_SD_CARD

@@ -3,7 +3,7 @@
 ## Project Overview
 
 This is an ESP32-C6 based datalogger project designed for the **Seeed Studio XIAO ESP32-C6** development board. It collects sensor data from multiple sources and is designed for modular expansion. 
-The goal is to collect ans save sensor data as efficiently as possible to be run at as high of a frequency as possible.
+The goal is to collect and save sensor data as efficiently as possible to be run at as high of a frequency as possible.
 
 ### Hardware Platform
 - **MCU**: ESP32-C6 (RISC-V based)
