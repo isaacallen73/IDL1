@@ -30,3 +30,23 @@ Below is short explanation of remaining files in the project folder.
 ```
 Additionally, the sample project contains Makefile and component.mk files, used for the legacy Make based build system. 
 They are not used or needed when building with CMake and idf.py.
+
+## Android app
+
+This repository also contains an Android application in the `android-app/` folder. The Android project is included for convenience and should be built from Android Studio or the Gradle wrapper.
+
+- Do NOT commit `local.properties` or keystore files (`*.jks`, `*.keystore`). A project-level `.gitignore` is present to prevent accidental commits of these files.
+- To build locally, create `local.properties` (not checked in) containing your Android SDK path, for example:
+
+```
+sdk.dir=C:/Users/isaac/AppData/Local/Android/Sdk
+```
+
+- Open the `android-app` folder in Android Studio or run the Gradle wrapper from the `android-app` folder:
+
+```powershell
+cd android-app
+.\gradlew assembleDebug
+```
+
+- The repo-level `.gitignore` ignores `android-app/build/` and other generated files.
