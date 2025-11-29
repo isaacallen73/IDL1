@@ -1,0 +1,16 @@
+{
+  "folders": [
+    {
+      "path": "C:\\Users\\isaac\\Documents\\Saucy\\ESP\\Datalogger v2"
+    },
+    {
+      "path": "C:\\Users\\isaac\\Documents\\Saucy\\ESP\\Android"
+    }
+  ],
+  "settings": {
+    "search.exclude": {
+      "**/build": true,
+      "**/.gradle": true
+    }
+  }
+}

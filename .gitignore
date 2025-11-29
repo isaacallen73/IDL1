@@ -3,7 +3,6 @@ sdkconfig
 sdkconfig.old
 
 # Android workspace and app
-Saucy-ESP.code-workspace
 /android-app/
 /android-app/.gradle/
 /android-app/build/
