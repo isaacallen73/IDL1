@@ -6,3 +6,7 @@ CONFIG_BT_GATTS_ENABLE=y
 
 # Use Bluetooth 5.0 Extended Advertising (default for ESP32-C6)
 CONFIG_BT_BLE_50_FEATURES_SUPPORTED=y
+
+# Disable verbose SPI logging
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_SPI_MASTER_LOG_LEVEL_ERROR=y

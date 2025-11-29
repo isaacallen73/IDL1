@@ -667,10 +667,8 @@ esp_err_t sd_log_imu_batch(imu_sample_t *samples, size_t count)
 #define EXT_ADV_HANDLE  0
 #define NUM_EXT_ADV     1
 
-static uint8_t adv_service_uuid[16] = {
-    0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80,
-    0x00, 0x10, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00,
-};
+// Forward declaration for building advertising data
+static void build_adv_data(uint8_t *buffer, size_t *length);
 
 // Extended advertising parameters (BLE 5.0)
 static esp_ble_gap_ext_adv_params_t ext_adv_params = {
@@ -710,17 +708,48 @@ static struct gatts_profile_inst gl_profile = {
     .gatts_if = ESP_GATT_IF_NONE,
 };
 
+// Build BLE advertising data packet programmatically
+static void build_adv_data(uint8_t *buffer, size_t *length)
+{
+    uint8_t *p = buffer;
+    size_t name_len = strlen(DEVICE_NAME);
+
+    // Flags
+    *p++ = 0x02;  // Length
+    *p++ = 0x01;  // Type: Flags
+    *p++ = 0x06;  // LE General Discoverable, BR/EDR not supported
+
+    // Complete Local Name
+    *p++ = name_len + 1;  // Length (type byte + name)
+    *p++ = 0x09;          // Type: Complete Local Name
+    memcpy(p, DEVICE_NAME, name_len);
+    p += name_len;
+
+    // Complete 128-bit Service UUID
+    *p++ = 0x11;  // Length (1 type byte + 16 UUID bytes)
+    *p++ = 0x07;  // Type: Complete list of 128-bit UUIDs
+    // Service UUID: 000000FF-0000-1000-8000-00805F9B34FB (little-endian)
+    *p++ = 0xfb; *p++ = 0x34; *p++ = 0x9b; *p++ = 0x5f;
+    *p++ = 0x80; *p++ = 0x00; *p++ = 0x00; *p++ = 0x80;
+    *p++ = 0x00; *p++ = 0x10; *p++ = 0x00; *p++ = 0x00;
+    *p++ = 0xFF; *p++ = 0x00; *p++ = 0x00; *p++ = 0x00;
+
+    *length = p - buffer;
+}
+
 // GAP Event Handler (BLE 5.0 Extended Advertising)
 static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
 {
     switch (event) {
         case ESP_GAP_BLE_EXT_ADV_SET_PARAMS_COMPLETE_EVT:
             ESP_LOGI(GATTS_TAG, "Extended advertising params set, status=%d", param->ext_adv_set_params.status);
-            // Set device name
-            esp_ble_gap_set_device_name(DEVICE_NAME);
 
-            // Set extended advertising data
-            esp_ble_gap_config_ext_adv_data_raw(EXT_ADV_HANDLE, sizeof(adv_service_uuid), adv_service_uuid);
+            // Build and set extended advertising data with device name
+            uint8_t adv_data[64];
+            size_t adv_data_len;
+            build_adv_data(adv_data, &adv_data_len);
+
+            esp_ble_gap_config_ext_adv_data_raw(EXT_ADV_HANDLE, adv_data_len, adv_data);
             break;
 
         case ESP_GAP_BLE_EXT_ADV_DATA_SET_COMPLETE_EVT:
@@ -747,6 +776,28 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
 
         case ESP_GAP_BLE_UPDATE_CONN_PARAMS_EVT:
             ESP_LOGI(GATTS_TAG, "Connection params updated: status=%d", param->update_conn_params.status);
+            break;
+
+        case ESP_GAP_BLE_PASSKEY_REQ_EVT:
+            ESP_LOGI(GATTS_TAG, "Passkey request - using default (000000)");
+            break;
+
+        case ESP_GAP_BLE_NC_REQ_EVT:
+            ESP_LOGI(GATTS_TAG, "Numeric comparison request");
+            esp_ble_confirm_reply(param->ble_security.ble_req.bd_addr, true);
+            break;
+
+        case ESP_GAP_BLE_SEC_REQ_EVT:
+            ESP_LOGI(GATTS_TAG, "Security request");
+            esp_ble_gap_security_rsp(param->ble_security.ble_req.bd_addr, true);
+            break;
+
+        case ESP_GAP_BLE_AUTH_CMPL_EVT:
+            if (param->ble_security.auth_cmpl.success) {
+                ESP_LOGI(GATTS_TAG, "Authentication complete - bonding successful");
+            } else {
+                ESP_LOGW(GATTS_TAG, "Authentication failed, fail_reason=0x%x", param->ble_security.auth_cmpl.fail_reason);
+            }
             break;
 
         default:
@@ -866,7 +917,6 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
 
             // Request MTU exchange
             esp_ble_gatt_set_local_mtu(BLE_MTU_SIZE);
-            esp_ble_gatts_send_indicate(gatts_if, param->connect.conn_id, imu_data_handle, 0, NULL, false);
 
             // Update connection parameters for high throughput
             esp_ble_conn_update_params_t conn_params = {0};
@@ -1046,6 +1096,23 @@ esp_err_t ble_init(void)
         return ret;
     }
     ESP_LOGI(GATTS_TAG, "Bluedroid stack enabled");
+
+    // Set security parameters - disable bonding/authentication for simplicity
+    esp_ble_auth_req_t auth_req = ESP_LE_AUTH_NO_BOND;  // No bonding required
+    esp_ble_io_cap_t iocap = ESP_IO_CAP_NONE;           // No input/output capability
+    uint8_t key_size = 16;
+    uint8_t init_key = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
+    uint8_t rsp_key = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
+    uint8_t auth_option = ESP_BLE_ONLY_ACCEPT_SPECIFIED_AUTH_DISABLE;
+
+    esp_ble_gap_set_security_param(ESP_BLE_SM_AUTHEN_REQ_MODE, &auth_req, sizeof(uint8_t));
+    esp_ble_gap_set_security_param(ESP_BLE_SM_IOCAP_MODE, &iocap, sizeof(uint8_t));
+    esp_ble_gap_set_security_param(ESP_BLE_SM_MAX_KEY_SIZE, &key_size, sizeof(uint8_t));
+    esp_ble_gap_set_security_param(ESP_BLE_SM_ONLY_ACCEPT_SPECIFIED_SEC_AUTH, &auth_option, sizeof(uint8_t));
+    esp_ble_gap_set_security_param(ESP_BLE_SM_SET_INIT_KEY, &init_key, sizeof(uint8_t));
+    esp_ble_gap_set_security_param(ESP_BLE_SM_SET_RSP_KEY, &rsp_key, sizeof(uint8_t));
+
+    ESP_LOGI(GATTS_TAG, "Security configured: No bonding required");
 
     // Register callbacks
     ret = esp_ble_gatts_register_callback(gatts_event_handler);
