@@ -54,11 +54,13 @@
 
 // Buffering Configuration for High-Speed Data Logging
 #define IMU_BUFFER_SIZE 512         // Number of samples to buffer (512 samples = ~320ms at 1600Hz)
-#define IMU_BATCH_SIZE 256          // Write to SD every N samples
+#define SD_BATCH_SIZE 256           // Write to SD every N samples (larger = more efficient for SD)
+#define BLE_BATCH_SIZE 16           // Send via BLE every N samples (512 bytes = fits in one MTU)
 #define IMU_QUEUE_SIZE 64           // FreeRTOS queue depth
 
 // IMU Sample Structure - stores one timestamped sensor reading
-typedef struct {
+// __attribute__((packed)) ensures no padding bytes are added
+typedef struct __attribute__((packed)) {
     int64_t timestamp_us;  // Microsecond timestamp
     float accX, accY, accZ;
     float gyroX, gyroY, gyroZ;
@@ -303,11 +305,11 @@ void bmi160_sensor_task(void *pvParameters)
 #ifdef ENABLE_SD_CARD
 void data_writer_task(void *pvParameters)
 {
-    imu_sample_t batch_buffer[IMU_BATCH_SIZE];
+    imu_sample_t batch_buffer[SD_BATCH_SIZE];
     size_t batch_count = 0;
     uint32_t total_written = 0;
 
-    ESP_LOGI(TAG, "SD writer task started (batch size: %d samples)", IMU_BATCH_SIZE);
+    ESP_LOGI(TAG, "SD writer task started (SD batch: %d, BLE batch: %d samples)", SD_BATCH_SIZE, BLE_BATCH_SIZE);
 
     while (1) {
         imu_sample_t sample;
@@ -317,8 +319,19 @@ void data_writer_task(void *pvParameters)
             // Add to batch buffer
             batch_buffer[batch_count++] = sample;
 
-            // When batch is full, write to SD card and/or send over BLE
-            if (batch_count >= IMU_BATCH_SIZE) {
+            // Send smaller batches over BLE for efficiency (every BLE_BATCH_SIZE samples)
+#ifdef ENABLE_BLUETOOTH
+            if (batch_count % BLE_BATCH_SIZE == 0) {
+                // Send last BLE_BATCH_SIZE samples
+                esp_err_t ble_ret = ble_send_imu_batch(&batch_buffer[batch_count - BLE_BATCH_SIZE], BLE_BATCH_SIZE);
+                if (ble_ret != ESP_OK && ble_is_connected) {
+                    ESP_LOGW(TAG, "Failed to send %d samples over BLE", BLE_BATCH_SIZE);
+                }
+            }
+#endif
+
+            // When batch is full, write to SD card
+            if (batch_count >= SD_BATCH_SIZE) {
 #ifdef ENABLE_SD_CARD
                 if (sd_card != NULL && data_log_file != NULL) {
                     esp_err_t ret = sd_log_imu_batch(batch_buffer, batch_count);
@@ -330,21 +343,10 @@ void data_writer_task(void *pvParameters)
                     }
                 }
 #endif
-
-#ifdef ENABLE_BLUETOOTH
-                // Send over BLE if connected
-                esp_err_t ble_ret = ble_send_imu_batch(batch_buffer, batch_count);
-                if (ble_ret == ESP_OK) {
-                    ESP_LOGI(TAG, "Sent %d samples over BLE", batch_count);
-                } else if (ble_is_connected) {
-                    ESP_LOGW(TAG, "Failed to send IMU batch over BLE");
-                }
-#endif
-
                 batch_count = 0;  // Reset batch
             }
         } else {
-            // Timeout - write partial batch if any
+            // Timeout - write partial batch to SD if any
             if (batch_count > 0) {
 #ifdef ENABLE_SD_CARD
                 if (sd_card != NULL && data_log_file != NULL) {
@@ -355,15 +357,7 @@ void data_writer_task(void *pvParameters)
                     }
                 }
 #endif
-
-#ifdef ENABLE_BLUETOOTH
-                // Send partial batch over BLE if connected
-                esp_err_t ble_ret = ble_send_imu_batch(batch_buffer, batch_count);
-                if (ble_ret == ESP_OK) {
-                    ESP_LOGI(TAG, "Sent partial batch: %d samples over BLE", batch_count);
-                }
-#endif
-
+                // Note: Don't send partial batches over BLE on timeout - BLE sends happen every BLE_BATCH_SIZE samples
                 batch_count = 0;
             }
         }
@@ -983,6 +977,13 @@ esp_err_t ble_send_imu_batch(imu_sample_t *samples, size_t count)
     size_t total_size = count * sizeof(imu_sample_t);
     uint8_t *data_ptr = (uint8_t *)samples;
 
+    // Lightweight logging - only log occasionally to avoid watchdog timeout
+    static uint32_t log_counter = 0;
+    if (log_counter++ % 100 == 0) {
+        ESP_LOGI(GATTS_TAG, "BLE: %zu samples * %zu bytes = %zu total",
+                 count, sizeof(imu_sample_t), total_size);
+    }
+
     // MTU overhead: 3 bytes for ATT header
     size_t usable_mtu = ble_mtu - 3;
 
@@ -1157,6 +1158,8 @@ void app_main(void)
     ESP_LOGI(TAG, "╔════════════════════════════════════════════════╗");
     ESP_LOGI(TAG, "║     DATALOGGER V2 - XIAO ESP32-C6              ║");
     ESP_LOGI(TAG, "╚════════════════════════════════════════════════╝");
+    ESP_LOGI(TAG, "DEBUG: sizeof(imu_sample_t) = %zu bytes", sizeof(imu_sample_t));
+    ESP_LOGI(TAG, "DEBUG: sizeof(int64_t) = %zu, sizeof(float) = %zu", sizeof(int64_t), sizeof(float));
     ESP_LOGI(TAG, "Enabled modules:");
 #ifdef ENABLE_I2C_SENSORS
     ESP_LOGI(TAG, "  ✓ I2C Sensors (BMI160 IMU via PCA9548A mux)");
