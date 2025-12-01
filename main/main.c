@@ -399,6 +399,39 @@ void gps_task(void *pvParameters)
     ESP_ERROR_CHECK(uart_set_pin(GPS_UART_NUM, GPS_TX_PIN, GPS_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
 
     ESP_LOGI(TAG, "GPS UART configured successfully");
+
+    // Configure GPS update rate to 5Hz (200ms interval) for smoother data flow
+    // UBX-CFG-RATE: measRate=200ms, navRate=1, timeRef=UTC
+    const uint8_t ubx_set_5hz[] = {
+        0xB5, 0x62,       // Header
+        0x06, 0x08,       // CFG-RATE
+        0x06, 0x00,       // Length: 6 bytes
+        0xC8, 0x00,       // measRate: 200ms (0x00C8 = 200 decimal)
+        0x01, 0x00,       // navRate: 1 (every measurement)
+        0x01, 0x00,       // timeRef: 1 = UTC
+        0xDE, 0x6A        // Checksum
+    };
+
+    uart_write_bytes(GPS_UART_NUM, ubx_set_5hz, sizeof(ubx_set_5hz));
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    // Configure GPS to only output GGA and RMC sentences (disable GLL, GSA, GSV, VTG)
+    // UBX protocol: Disable unwanted NMEA sentences
+    const uint8_t ubx_disable_gll[] = {0xB5, 0x62, 0x06, 0x01, 0x08, 0x00, 0xF0, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2A}; // GLL
+    const uint8_t ubx_disable_gsa[] = {0xB5, 0x62, 0x06, 0x01, 0x08, 0x00, 0xF0, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x31}; // GSA
+    const uint8_t ubx_disable_gsv[] = {0xB5, 0x62, 0x06, 0x01, 0x08, 0x00, 0xF0, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x38}; // GSV
+    const uint8_t ubx_disable_vtg[] = {0xB5, 0x62, 0x06, 0x01, 0x08, 0x00, 0xF0, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x46}; // VTG
+
+    uart_write_bytes(GPS_UART_NUM, ubx_disable_gll, sizeof(ubx_disable_gll));
+    vTaskDelay(pdMS_TO_TICKS(100));
+    uart_write_bytes(GPS_UART_NUM, ubx_disable_gsa, sizeof(ubx_disable_gsa));
+    vTaskDelay(pdMS_TO_TICKS(100));
+    uart_write_bytes(GPS_UART_NUM, ubx_disable_gsv, sizeof(ubx_disable_gsv));
+    vTaskDelay(pdMS_TO_TICKS(100));
+    uart_write_bytes(GPS_UART_NUM, ubx_disable_vtg, sizeof(ubx_disable_vtg));
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    ESP_LOGI(TAG, "GPS configured: 5Hz update rate, only GGA and RMC sentences");
     ESP_LOGI(TAG, "Listening for NMEA sentences...");
     ESP_LOGI(TAG, "NOTE: GPS may take 30-60s for cold start (first fix)");
     ESP_LOGI(TAG, "      Ensure GPS antenna has clear view of sky");
@@ -406,33 +439,63 @@ void gps_task(void *pvParameters)
 
     // Buffer for GPS data
     uint8_t* data = (uint8_t*) malloc(GPS_BUF_SIZE);
+    static char sentence_buffer[256];  // Buffer for individual NMEA sentence
+    static int sentence_pos = 0;
     int no_data_count = 0;
 
     while (1) {
-        // Read data from UART
-        int len = uart_read_bytes(GPS_UART_NUM, data, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(1000));
+        // Read data from UART with short timeout to prevent buffering
+        // GPS outputs at 5Hz (200ms), so read every 100ms to stay ahead
+        int len = uart_read_bytes(GPS_UART_NUM, data, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(100));
 
         if (len > 0) {
             data[len] = '\0';  // Null terminate
-            ESP_LOGI(TAG, "GPS: %s", (char*)data);
 
-            // Log to SD card if enabled
+            // Process byte by byte to extract individual NMEA sentences
+            for (int i = 0; i < len; i++) {
+                char c = data[i];
+
+                // Start of new sentence (begins with $)
+                if (c == '$') {
+                    sentence_pos = 0;
+                    sentence_buffer[sentence_pos++] = c;
+                }
+                // End of sentence (newline)
+                else if (c == '\n' || c == '\r') {
+                    if (sentence_pos > 0) {
+                        sentence_buffer[sentence_pos] = '\0';  // Null terminate
+
+                        // Only process if sentence starts with $ and has content
+                        if (sentence_buffer[0] == '$' && sentence_pos > 5) {
+                            ESP_LOGI(TAG, "GPS: %s", sentence_buffer);
+
+                            // Log to SD card if enabled
 #ifdef ENABLE_SD_CARD
-            if (sd_card != NULL) {
-                esp_err_t ret = sd_log_gps((char*)data);
-                if (ret != ESP_OK) {
-                    ESP_LOGW(TAG, "Failed to write GPS data to SD card");
+                            if (sd_card != NULL) {
+                                esp_err_t ret = sd_log_gps(sentence_buffer);
+                                if (ret != ESP_OK) {
+                                    ESP_LOGW(TAG, "Failed to write GPS data to SD card");
+                                }
+                            }
+#endif
+
+                            // Send over BLE if enabled and connected
+#ifdef ENABLE_BLUETOOTH
+                            esp_err_t ble_ret = ble_send_gps_data(sentence_buffer);
+                            if (ble_ret != ESP_OK && ble_is_connected) {
+                                ESP_LOGW(TAG, "Failed to send GPS data over BLE");
+                            }
+#endif
+                        }
+
+                        sentence_pos = 0;  // Reset for next sentence
+                    }
+                }
+                // Build sentence character by character
+                else if (sentence_pos < sizeof(sentence_buffer) - 1) {
+                    sentence_buffer[sentence_pos++] = c;
                 }
             }
-#endif
-
-            // Send over BLE if enabled and connected
-#ifdef ENABLE_BLUETOOTH
-            esp_err_t ble_ret = ble_send_gps_data((char*)data);
-            if (ble_ret != ESP_OK && ble_is_connected) {
-                ESP_LOGW(TAG, "Failed to send GPS data over BLE");
-            }
-#endif
 
             no_data_count = 0;  // Reset counter
         } else {

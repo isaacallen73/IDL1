@@ -27,21 +27,28 @@ The project uses **feature flags** for conditional compilation, defined at the t
 #define ENABLE_I2C_SENSORS    // Enable I2C multiplexer and BMI160 IMU
 #define ENABLE_GPS            // Enable GPS module
 #define ENABLE_SD_CARD        // Enable SD card logging
+#define ENABLE_BLUETOOTH      // Enable BLE data streaming
 ```
 
 Comment out these defines to disable specific modules. This allows the code to be compiled for different hardware configurations without modification.
 
 ### Hardware Modules
 
-#### 1. GPS Module (GT-U7)
+#### 1. GPS Module (GT-U7 / NEO-6)
 - **Status**: WORKING
 - **Interface**: UART1
 - **Pins**:
   - RX: GPIO17 (D6) - Receives NMEA data from GPS
-  - TX: GPIO16 (D7) - Sends commands to GPS (optional)
+  - TX: GPIO16 (D7) - Sends UBX configuration commands to GPS
 - **Baud Rate**: 9600
-- **Implementation**: [main/main.c:139-196](main/main.c#L139-L196)
-- **Task**: `gps_task()` reads and logs NMEA sentences
+- **Update Rate**: 5Hz (200ms interval) - configured via UBX-CFG-RATE
+- **NMEA Sentences**: GGA and RMC only (GLL, GSA, GSV, VTG disabled via UBX)
+- **Implementation**: [main/main.c:375-520](main/main.c#L375-L520)
+- **Task**: `gps_task()` reads NMEA sentences with 100ms polling interval
+- **Configuration**: GPS module configured at startup via UBX protocol to:
+  - Set 5Hz update rate (200ms between fixes)
+  - Disable unnecessary NMEA sentences (GLL, GSA, GSV, VTG)
+  - Enable only GGA (position/altitude/fix) and RMC (position/speed/time)
 
 #### 2. I2C Sensors (DISABLED)
 - **Status**: DISABLED - Hardware issues on current board
@@ -76,12 +83,37 @@ Comment out these defines to disable specific modules. This allows the code to b
   - Prints card info (type, capacity) on initialization
   - Graceful degradation if SD card fails to mount
 
+#### 4. Bluetooth BLE Module
+- **Status**: WORKING
+- **Protocol**: BLE 5.0 Extended Advertising
+- **Service UUID**: 0x00FF (16-bit)
+- **Characteristics**:
+  - IMU Data: 0xFF01 (binary imu_sample_t structures)
+  - GPS Data: 0xFF02 (NMEA sentence strings)
+- **Device Name**: "ESP32-Datalogger"
+- **Security**: No bonding/pairing required (open connection)
+- **MTU**: Up to 512 bytes
+- **Implementation**: [main/main.c:662-1130](main/main.c#L662-L1130)
+- **Features**:
+  - Extended Advertising with device name broadcast
+  - GATT server with notifications enabled
+  - CCCD descriptors for proper notification support
+  - Automatic reconnection on disconnect
+
 ### FreeRTOS Tasks
 
 The application uses FreeRTOS tasks for concurrent operation:
 
-1. **`gps_task`**: Continuously reads UART data from GPS module
-2. **`bmi160_test`**: (Disabled) Reads IMU data at 1Hz
+| Task Name | Priority | Stack Size | Description |
+|-----------|----------|------------|-------------|
+| `bmi160_sensor_task` | 10 (highest) | 8KB | High-frequency IMU polling (3.4kHz target) |
+| `gps_task` | 5 (medium) | 4KB | UART polling every 100ms for GPS data |
+| `data_writer_task` | 3 (lowest) | 10KB | Writes batched data to SD card and BLE |
+
+**Task Priority Rationale**:
+- IMU sensor task runs at highest priority (10) to maintain consistent high-frequency polling
+- GPS task at medium priority (5) polls UART every 100ms to prevent buffering
+- Data writer at lowest priority (3) handles non-time-critical SD/BLE writes
 
 Tasks are created in `app_main()` based on enabled feature flags.
 
