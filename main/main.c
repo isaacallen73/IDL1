@@ -42,8 +42,11 @@
 
 // PCA9548A Multiplexer Configuration
 #define PCA9548A_ADDR 0x70
-#define BMI160_MUX_CHANNEL 2      // BMI160 is on channel 2
+#define BMI160_MUX_CHANNEL_2 2      // First BMI160 on channel 2
+#define BMI160_MUX_CHANNEL_3 3      // Second BMI160 on channel 3
+#define BMI160_MUX_CHANNEL_4 4      // Third BMI160 on channel 4
 #define PCA9548A_CHANNEL(n) (1 << (n))  // Channel select macro
+#define NUM_IMUS 3                  // Total number of IMU sensors
 
 // BMI160 I2C Address (depends on SDO pin connection)
 #ifdef CONFIG_EXAMPLE_I2C_ADDRESS_GND
@@ -58,7 +61,7 @@
 #define BLE_BATCH_SIZE 16           // Send via BLE every N samples (512 bytes = fits in one MTU)
 #define IMU_QUEUE_SIZE 64           // FreeRTOS queue depth
 
-// IMU Sample Structure - stores one timestamped sensor reading
+// IMU Sample Structure - stores one timestamped sensor reading from a single IMU
 // __attribute__((packed)) ensures no padding bytes are added
 typedef struct __attribute__((packed)) {
     int64_t timestamp_us;  // Microsecond timestamp
@@ -66,8 +69,21 @@ typedef struct __attribute__((packed)) {
     float gyroX, gyroY, gyroZ;
 } imu_sample_t;
 
-// Global queue for passing samples from sensor task to SD task
+// Combined IMU Sample Structure - stores readings from all 3 IMUs at once
+typedef struct __attribute__((packed)) {
+    int64_t timestamp_us;  // Microsecond timestamp
+    imu_sample_t imu2;     // Data from IMU on channel 2
+    imu_sample_t imu3;     // Data from IMU on channel 3
+    imu_sample_t imu4;     // Data from IMU on channel 4
+} combined_imu_sample_t;
+
+// Global queue for passing combined samples from sensor task to SD task
 static QueueHandle_t imu_queue = NULL;
+
+// Static buffers for data_writer_task (to avoid stack overflow)
+// Allocated in global memory instead of on task stack
+static combined_imu_sample_t batch_buffer[SD_BATCH_SIZE];
+static combined_imu_sample_t ble_batch_buffer[BLE_BATCH_SIZE];  // BLE uses combined samples directly
 
 #endif
 
@@ -138,11 +154,11 @@ esp_err_t sd_log_imu_batch(imu_sample_t *samples, size_t count);  // Fast binary
 // BLE Service and Characteristic UUIDs
 // Custom 128-bit UUIDs for our datalogger service
 #define GATTS_SERVICE_UUID_DATALOGGER   0x00FF
-#define GATTS_CHAR_UUID_IMU_DATA        0xFF01
+#define GATTS_CHAR_UUID_IMU_DATA        0xFF01  // Combined IMU data (all 3 channels)
 #define GATTS_CHAR_UUID_GPS_DATA        0xFF02
 
 // GATT Server Configuration
-#define GATTS_NUM_HANDLE                8
+#define GATTS_NUM_HANDLE                8  // Service + 2 characteristics + 2 CCCDs
 #define GATTS_DEMO_CHAR_VAL_LEN_MAX     512
 #define PREPARE_BUF_MAX_SIZE            1024
 #define DEVICE_NAME                     "ESP32-Datalogger"
@@ -161,16 +177,17 @@ static uint16_t ble_conn_id = 0xFFFF;  // Connection ID (0xFFFF = not connected)
 static uint16_t ble_gatts_if = 0xFF;   // GATT server interface
 static bool ble_is_connected = false;
 static uint16_t ble_mtu = 23;          // Current MTU (starts at minimum)
+static bool ble_characteristics_ready = false;  // All characteristics initialized
 
 // Characteristic handles
-static uint16_t imu_data_handle = 0;
+static uint16_t imu_data_handle = 0;   // Combined IMU data (all 3 channels)
 static uint16_t gps_data_handle = 0;
 
 // Forward declarations for BLE functions
 static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param);
 static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param);
 esp_err_t ble_init(void);
-esp_err_t ble_send_imu_batch(imu_sample_t *samples, size_t count);
+esp_err_t ble_send_combined_imu_batch(combined_imu_sample_t *samples, size_t count);
 esp_err_t ble_send_gps_data(const char *nmea_sentence);
 
 #endif // ENABLE_BLUETOOTH
@@ -201,34 +218,58 @@ void bmi160_sensor_task(void *pvParameters)
     mux_dev.cfg.sda_io_num = I2C_MASTER_SDA_IO;
     mux_dev.cfg.scl_io_num = I2C_MASTER_SCL_IO;
 
-    // Enable channel 2 for BMI160
-    ESP_LOGI(TAG, "Enabling PCA9548A channel %d for BMI160", BMI160_MUX_CHANNEL);
-    uint8_t channel_mask = PCA9548A_CHANNEL(BMI160_MUX_CHANNEL);
-    ESP_ERROR_CHECK(i2c_dev_write(&mux_dev, NULL, 0, &channel_mask, 1));
+    // Initialize all 3 BMI160 sensors
+    bmi160_t bmi160_dev_ch2, bmi160_dev_ch3, bmi160_dev_ch4;
 
-    // Initialize BMI160 sensor
-    bmi160_t bmi160_dev;
-    memset(&bmi160_dev.i2c_dev, 0, sizeof(i2c_dev_t));
-
-    ESP_LOGI(TAG, "Initializing BMI160");
-    ESP_ERROR_CHECK(bmi160_init(&bmi160_dev, BMI160_ADDR, I2C_PORT, I2C_MASTER_SDA_IO, I2C_MASTER_SCL_IO));
-    ESP_ERROR_CHECK(bmi160_self_test(&bmi160_dev));
-
+    // Configuration for all IMUs - set to 800Hz for stable data
     bmi160_conf_t bmi160_conf = {
         .accRange = BMI160_ACC_RANGE_2G,
-        .accOdr = BMI160_ACC_ODR_1600HZ,  // Maximum rate: 1600Hz
+        .accOdr = BMI160_ACC_ODR_800HZ,  // 800Hz for stable data
         .accAvg = BMI160_ACC_LP_AVG_2,
         .accMode = BMI160_PMU_ACC_NORMAL,
         .gyrRange = BMI160_GYR_RANGE_125DPS,
-        .gyrOdr = BMI160_GYR_ODR_1600HZ,  // Maximum rate: 1600Hz
+        .gyrOdr = BMI160_GYR_ODR_800HZ,  // 800Hz for stable data
         .gyrMode = BMI160_PMU_GYR_NORMAL,
         .accUs = 0u
     };
 
-    ESP_ERROR_CHECK(bmi160_start(&bmi160_dev, &bmi160_conf));
-    ESP_ERROR_CHECK(bmi160_calibrate(&bmi160_dev));
+    // Initialize BMI160 on channel 2
+    ESP_LOGI(TAG, "Enabling PCA9548A channel %d for BMI160 #1", BMI160_MUX_CHANNEL_2);
+    uint8_t channel_mask = PCA9548A_CHANNEL(BMI160_MUX_CHANNEL_2);
+    ESP_ERROR_CHECK(i2c_dev_write(&mux_dev, NULL, 0, &channel_mask, 1));
 
-    ESP_LOGI(TAG, "Starting high-speed buffered polling (1600Hz ODR)...");
+    memset(&bmi160_dev_ch2.i2c_dev, 0, sizeof(i2c_dev_t));
+    ESP_LOGI(TAG, "Initializing BMI160 on channel 2");
+    ESP_ERROR_CHECK(bmi160_init(&bmi160_dev_ch2, BMI160_ADDR, I2C_PORT, I2C_MASTER_SDA_IO, I2C_MASTER_SCL_IO));
+    ESP_ERROR_CHECK(bmi160_self_test(&bmi160_dev_ch2));
+    ESP_ERROR_CHECK(bmi160_start(&bmi160_dev_ch2, &bmi160_conf));
+    ESP_ERROR_CHECK(bmi160_calibrate(&bmi160_dev_ch2));
+
+    // Initialize BMI160 on channel 3
+    ESP_LOGI(TAG, "Enabling PCA9548A channel %d for BMI160 #2", BMI160_MUX_CHANNEL_3);
+    channel_mask = PCA9548A_CHANNEL(BMI160_MUX_CHANNEL_3);
+    ESP_ERROR_CHECK(i2c_dev_write(&mux_dev, NULL, 0, &channel_mask, 1));
+
+    memset(&bmi160_dev_ch3.i2c_dev, 0, sizeof(i2c_dev_t));
+    ESP_LOGI(TAG, "Initializing BMI160 on channel 3");
+    ESP_ERROR_CHECK(bmi160_init(&bmi160_dev_ch3, BMI160_ADDR, I2C_PORT, I2C_MASTER_SDA_IO, I2C_MASTER_SCL_IO));
+    ESP_ERROR_CHECK(bmi160_self_test(&bmi160_dev_ch3));
+    ESP_ERROR_CHECK(bmi160_start(&bmi160_dev_ch3, &bmi160_conf));
+    ESP_ERROR_CHECK(bmi160_calibrate(&bmi160_dev_ch3));
+
+    // Initialize BMI160 on channel 4
+    ESP_LOGI(TAG, "Enabling PCA9548A channel %d for BMI160 #3", BMI160_MUX_CHANNEL_4);
+    channel_mask = PCA9548A_CHANNEL(BMI160_MUX_CHANNEL_4);
+    ESP_ERROR_CHECK(i2c_dev_write(&mux_dev, NULL, 0, &channel_mask, 1));
+
+    memset(&bmi160_dev_ch4.i2c_dev, 0, sizeof(i2c_dev_t));
+    ESP_LOGI(TAG, "Initializing BMI160 on channel 4");
+    ESP_ERROR_CHECK(bmi160_init(&bmi160_dev_ch4, BMI160_ADDR, I2C_PORT, I2C_MASTER_SDA_IO, I2C_MASTER_SCL_IO));
+    ESP_ERROR_CHECK(bmi160_self_test(&bmi160_dev_ch4));
+    ESP_ERROR_CHECK(bmi160_start(&bmi160_dev_ch4, &bmi160_conf));
+    ESP_ERROR_CHECK(bmi160_calibrate(&bmi160_dev_ch4));
+
+    ESP_LOGI(TAG, "All 3 BMI160 sensors initialized at 800Hz ODR");
 
     // Performance measurement variables
     uint32_t sample_count = 0;
@@ -237,41 +278,88 @@ void bmi160_sensor_task(void *pvParameters)
     int64_t start_time = esp_timer_get_time();
     int64_t last_report_time = start_time;
 
-    // Main sensor reading loop - poll as fast as possible
+    // Main sensor reading loop - poll all 3 IMUs sequentially
     while (1) {
-        bmi160_result_t result;
-        esp_err_t ret = bmi160_read_data(&bmi160_dev, &result);
+        bmi160_result_t result_ch2, result_ch3, result_ch4;
+        int64_t timestamp = esp_timer_get_time();
+        bool all_success = true;
 
-        if (ret == ESP_OK) {
+        // Read from channel 2
+        channel_mask = PCA9548A_CHANNEL(BMI160_MUX_CHANNEL_2);
+        i2c_dev_write(&mux_dev, NULL, 0, &channel_mask, 1);
+        if (bmi160_read_data(&bmi160_dev_ch2, &result_ch2) != ESP_OK) {
+            error_count++;
+            all_success = false;
+        }
+
+        // Read from channel 3
+        channel_mask = PCA9548A_CHANNEL(BMI160_MUX_CHANNEL_3);
+        i2c_dev_write(&mux_dev, NULL, 0, &channel_mask, 1);
+        if (bmi160_read_data(&bmi160_dev_ch3, &result_ch3) != ESP_OK) {
+            error_count++;
+            all_success = false;
+        }
+
+        // Read from channel 4
+        channel_mask = PCA9548A_CHANNEL(BMI160_MUX_CHANNEL_4);
+        i2c_dev_write(&mux_dev, NULL, 0, &channel_mask, 1);
+        if (bmi160_read_data(&bmi160_dev_ch4, &result_ch4) != ESP_OK) {
+            error_count++;
+            all_success = false;
+        }
+
+        if (all_success) {
             sample_count++;
 
-            // Create timestamped sample
-            imu_sample_t sample = {
-                .timestamp_us = esp_timer_get_time(),
-                .accX = result.accX,
-                .accY = result.accY,
-                .accZ = result.accZ,
-                .gyroX = result.gyroX,
-                .gyroY = result.gyroY,
-                .gyroZ = result.gyroZ
-            };
+            // Create combined timestamped sample with all 3 IMUs
+            combined_imu_sample_t combined_sample;
+            combined_sample.timestamp_us = timestamp;
+
+            // IMU channel 2 data
+            combined_sample.imu2.timestamp_us = timestamp;
+            combined_sample.imu2.accX = result_ch2.accX;
+            combined_sample.imu2.accY = result_ch2.accY;
+            combined_sample.imu2.accZ = result_ch2.accZ;
+            combined_sample.imu2.gyroX = result_ch2.gyroX;
+            combined_sample.imu2.gyroY = result_ch2.gyroY;
+            combined_sample.imu2.gyroZ = result_ch2.gyroZ;
+
+            // IMU channel 3 data
+            combined_sample.imu3.timestamp_us = timestamp;
+            combined_sample.imu3.accX = result_ch3.accX;
+            combined_sample.imu3.accY = result_ch3.accY;
+            combined_sample.imu3.accZ = result_ch3.accZ;
+            combined_sample.imu3.gyroX = result_ch3.gyroX;
+            combined_sample.imu3.gyroY = result_ch3.gyroY;
+            combined_sample.imu3.gyroZ = result_ch3.gyroZ;
+
+            // IMU channel 4 data
+            combined_sample.imu4.timestamp_us = timestamp;
+            combined_sample.imu4.accX = result_ch4.accX;
+            combined_sample.imu4.accY = result_ch4.accY;
+            combined_sample.imu4.accZ = result_ch4.accZ;
+            combined_sample.imu4.gyroX = result_ch4.gyroX;
+            combined_sample.imu4.gyroY = result_ch4.gyroY;
+            combined_sample.imu4.gyroZ = result_ch4.gyroZ;
 
             // Send to queue (non-blocking to avoid slowing down sensor polling)
             if (imu_queue != NULL) {
-                if (xQueueSend(imu_queue, &sample, 0) != pdTRUE) {
+                if (xQueueSend(imu_queue, &combined_sample, 0) != pdTRUE) {
                     queue_full_count++;  // Queue full - sample dropped
                 }
             }
 
             // Print every 500th sample to reduce serial overhead
+            /*
             if (sample_count % 500 == 0) {
-                ESP_LOGI(TAG, "Sample %lu: Acc[%+.3f %+.3f %+.3f] Gyro[%+.3f %+.3f %+.3f]",
-                         sample_count,
-                         result.accX, result.accY, result.accZ,
-                         result.gyroX, result.gyroY, result.gyroZ);
+                ESP_LOGI(TAG, "Sample %lu: CH2 Acc[%+.3f %+.3f %+.3f]",
+                         sample_count, result_ch2.accX, result_ch2.accY, result_ch2.accZ);
+                ESP_LOGI(TAG, "Sample %lu: CH3 Acc[%+.3f %+.3f %+.3f]",
+                         sample_count, result_ch3.accX, result_ch3.accY, result_ch3.accZ);
+                ESP_LOGI(TAG, "Sample %lu: CH4 Acc[%+.3f %+.3f %+.3f]",
+                         sample_count, result_ch4.accX, result_ch4.accY, result_ch4.accZ);
             }
-        } else {
-            error_count++;
+            */
         }
 
         // Report polling rate every second
@@ -298,35 +386,55 @@ void bmi160_sensor_task(void *pvParameters)
         }
     }
 
-    ESP_ERROR_CHECK(bmi160_free(&bmi160_dev));
+    // Cleanup (this code is never reached in normal operation)
+    ESP_ERROR_CHECK(bmi160_free(&bmi160_dev_ch2));
+    ESP_ERROR_CHECK(bmi160_free(&bmi160_dev_ch3));
+    ESP_ERROR_CHECK(bmi160_free(&bmi160_dev_ch4));
 }
 
 // Low-priority data writer task (SD card and/or Bluetooth)
-#ifdef ENABLE_SD_CARD
+#if defined(ENABLE_SD_CARD) || defined(ENABLE_BLUETOOTH)
 void data_writer_task(void *pvParameters)
 {
-    imu_sample_t batch_buffer[SD_BATCH_SIZE];
+    // Buffers are now statically allocated to avoid stack overflow
+    // See global declarations above
     size_t batch_count = 0;
+    size_t ble_batch_count = 0;
     uint32_t total_written = 0;
 
     ESP_LOGI(TAG, "SD writer task started (SD batch: %d, BLE batch: %d samples)", SD_BATCH_SIZE, BLE_BATCH_SIZE);
 
     while (1) {
-        imu_sample_t sample;
+        combined_imu_sample_t combined_sample;
 
-        // Wait for samples from queue (with 1 second timeout)
-        if (xQueueReceive(imu_queue, &sample, pdMS_TO_TICKS(1000)) == pdTRUE) {
-            // Add to batch buffer
-            batch_buffer[batch_count++] = sample;
+        // Wait for combined samples from queue (with 1 second timeout)
+        if (xQueueReceive(imu_queue, &combined_sample, pdMS_TO_TICKS(1000)) == pdTRUE) {
+            // Add to batch buffers (SD and BLE use same combined sample structure)
+            batch_buffer[batch_count++] = combined_sample;
+            ble_batch_buffer[ble_batch_count++] = combined_sample;
 
             // Send smaller batches over BLE for efficiency (every BLE_BATCH_SIZE samples)
 #ifdef ENABLE_BLUETOOTH
-            if (batch_count % BLE_BATCH_SIZE == 0) {
-                // Send last BLE_BATCH_SIZE samples
-                esp_err_t ble_ret = ble_send_imu_batch(&batch_buffer[batch_count - BLE_BATCH_SIZE], BLE_BATCH_SIZE);
-                if (ble_ret != ESP_OK && ble_is_connected) {
-                    ESP_LOGW(TAG, "Failed to send %d samples over BLE", BLE_BATCH_SIZE);
+            if (ble_batch_count >= BLE_BATCH_SIZE) {
+                // Log sample values before sending
+                static uint32_t ble_send_count = 0;
+                if (ble_send_count++ % 20 == 0) {
+                    ESP_LOGI(TAG, "BLE Send - Combined[0]: CH2 Acc[%+.3f %+.3f %+.3f] CH3 Acc[%+.3f %+.3f %+.3f] CH4 Acc[%+.3f %+.3f %+.3f]",
+                             ble_batch_buffer[0].imu2.accX, ble_batch_buffer[0].imu2.accY, ble_batch_buffer[0].imu2.accZ,
+                             ble_batch_buffer[0].imu3.accX, ble_batch_buffer[0].imu3.accY, ble_batch_buffer[0].imu3.accZ,
+                             ble_batch_buffer[0].imu4.accX, ble_batch_buffer[0].imu4.accY, ble_batch_buffer[0].imu4.accZ);
                 }
+
+                // Send combined IMU data (all 3 channels in one characteristic)
+                esp_err_t ble_ret = ble_send_combined_imu_batch(ble_batch_buffer, BLE_BATCH_SIZE);
+                if (ble_ret != ESP_OK && ble_is_connected) {
+                    ESP_LOGW(TAG, "Failed to send combined IMU samples over BLE, error=0x%x", ble_ret);
+                } else if (ble_send_count % 20 == 0) {
+                    ESP_LOGI(TAG, "Combined IMU BLE send OK (%d samples, %zu bytes)",
+                             BLE_BATCH_SIZE, BLE_BATCH_SIZE * sizeof(combined_imu_sample_t));
+                }
+
+                ble_batch_count = 0;  // Reset BLE batch counter
             }
 #endif
 
@@ -334,12 +442,13 @@ void data_writer_task(void *pvParameters)
             if (batch_count >= SD_BATCH_SIZE) {
 #ifdef ENABLE_SD_CARD
                 if (sd_card != NULL && data_log_file != NULL) {
-                    esp_err_t ret = sd_log_imu_batch(batch_buffer, batch_count);
-                    if (ret == ESP_OK) {
+                    // Write combined samples as binary data
+                    size_t written = fwrite(batch_buffer, sizeof(combined_imu_sample_t), batch_count, data_log_file);
+                    if (written == batch_count) {
                         total_written += batch_count;
-                        ESP_LOGI(TAG, "Wrote %d samples to SD (total: %lu)", batch_count, total_written);
+                        ESP_LOGI(TAG, "Wrote %d combined samples to SD (total: %lu)", batch_count, total_written);
                     } else {
-                        ESP_LOGW(TAG, "Failed to write IMU batch to SD card");
+                        ESP_LOGW(TAG, "Failed to write combined IMU batch to SD card");
                     }
                 }
 #endif
@@ -350,8 +459,8 @@ void data_writer_task(void *pvParameters)
             if (batch_count > 0) {
 #ifdef ENABLE_SD_CARD
                 if (sd_card != NULL && data_log_file != NULL) {
-                    esp_err_t ret = sd_log_imu_batch(batch_buffer, batch_count);
-                    if (ret == ESP_OK) {
+                    size_t written = fwrite(batch_buffer, sizeof(combined_imu_sample_t), batch_count, data_log_file);
+                    if (written == batch_count) {
                         total_written += batch_count;
                         ESP_LOGI(TAG, "Wrote partial batch: %d samples (total: %lu)", batch_count, total_written);
                     }
@@ -363,7 +472,7 @@ void data_writer_task(void *pvParameters)
         }
     }
 }
-#endif // ENABLE_SD_CARD
+#endif // ENABLE_SD_CARD || ENABLE_BLUETOOTH
 
 #endif // ENABLE_I2C_SENSORS
 
@@ -467,7 +576,7 @@ void gps_task(void *pvParameters)
 
                         // Only process if sentence starts with $ and has content
                         if (sentence_buffer[0] == '$' && sentence_pos > 5) {
-                            ESP_LOGI(TAG, "GPS: %s", sentence_buffer);
+                            // ESP_LOGI(TAG, "GPS: %s", sentence_buffer);
 
                             // Log to SD card if enabled
 #ifdef ENABLE_SD_CARD
@@ -486,6 +595,10 @@ void gps_task(void *pvParameters)
                                 ESP_LOGW(TAG, "Failed to send GPS data over BLE");
                             }
 #endif
+
+                            // Yield to scheduler after processing each sentence
+                            // This allows IDLE task to run and reset watchdog timer
+                            taskYIELD();
                         }
 
                         sentence_pos = 0;  // Reset for next sentence
@@ -811,8 +924,15 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
 
         case ESP_GAP_BLE_EXT_ADV_DATA_SET_COMPLETE_EVT:
             ESP_LOGI(GATTS_TAG, "Extended advertising data set, status=%d", param->ext_adv_data_set.status);
-            // Now start advertising
+
+            // Skip scan response data - advertising data is sufficient for extended advertising
+            // Start advertising immediately after advertising data is set
             esp_ble_gap_ext_adv_start(NUM_EXT_ADV, &(esp_ble_gap_ext_adv_t){.instance = EXT_ADV_HANDLE, .duration = 0, .max_events = 0});
+            break;
+
+        case ESP_GAP_BLE_EXT_SCAN_RSP_DATA_SET_COMPLETE_EVT:
+            // Not used - we skip scan response data for extended advertising
+            ESP_LOGI(GATTS_TAG, "Scan response data set, status=%d", param->scan_rsp_set.status);
             break;
 
         case ESP_GAP_BLE_EXT_ADV_START_COMPLETE_EVT:
@@ -907,7 +1027,7 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
             // Store the characteristic handle based on UUID
             if (param->add_char.char_uuid.uuid.uuid16 == GATTS_CHAR_UUID_IMU_DATA) {
                 imu_data_handle = param->add_char.attr_handle;
-                ESP_LOGI(GATTS_TAG, "IMU data handle: %d", imu_data_handle);
+                ESP_LOGI(GATTS_TAG, "Combined IMU data handle (0xFF01): %d", imu_data_handle);
 
                 // Add CCCD (Client Characteristic Configuration Descriptor) for IMU notifications
                 esp_bt_uuid_t cccd_uuid;
@@ -925,7 +1045,7 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
                                                &cccd_val, NULL);
             } else if (param->add_char.char_uuid.uuid.uuid16 == GATTS_CHAR_UUID_GPS_DATA) {
                 gps_data_handle = param->add_char.attr_handle;
-                ESP_LOGI(GATTS_TAG, "GPS data handle: %d", gps_data_handle);
+                ESP_LOGI(GATTS_TAG, "GPS data handle (0xFF02): %d", gps_data_handle);
 
                 // Add CCCD for GPS notifications
                 esp_bt_uuid_t cccd_uuid;
@@ -960,6 +1080,15 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
                 if (add_gps_ret) {
                     ESP_LOGE(GATTS_TAG, "Add GPS char failed, error code=%x", add_gps_ret);
                 }
+            }
+            // After GPS descriptor is added, all characteristics are ready
+            else {
+                ble_characteristics_ready = true;
+                ESP_LOGI(GATTS_TAG, "═══════════════════════════════════════");
+                ESP_LOGI(GATTS_TAG, "All BLE characteristics initialized:");
+                ESP_LOGI(GATTS_TAG, "  Combined IMU (0xFF01) handle: %d", imu_data_handle);
+                ESP_LOGI(GATTS_TAG, "  GPS (0xFF02) handle: %d", gps_data_handle);
+                ESP_LOGI(GATTS_TAG, "═══════════════════════════════════════");
             }
             break;
 
@@ -1000,6 +1129,36 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
             ble_mtu = param->mtu.mtu;
             break;
 
+        case ESP_GATTS_WRITE_EVT:
+            ESP_LOGI(GATTS_TAG, "Write event: handle=%d, len=%d, is_prep=%d",
+                     param->write.handle, param->write.len, param->write.is_prep);
+
+            // Handle CCCD writes (client enabling/disabling notifications)
+            if (param->write.len == 2) {
+                uint16_t descr_value = param->write.value[1] << 8 | param->write.value[0];
+
+                // Determine which characteristic this belongs to
+                const char* char_name = "UNKNOWN";
+                if (param->write.handle == imu_data_handle + 1) char_name = "Combined IMU (0xFF01)";
+                else if (param->write.handle == gps_data_handle + 1) char_name = "GPS (0xFF02)";
+
+                if (descr_value == 0x0001) {
+                    ESP_LOGI(GATTS_TAG, "Notifications ENABLED for %s (handle %d)", char_name, param->write.handle);
+                } else if (descr_value == 0x0002) {
+                    ESP_LOGI(GATTS_TAG, "Indications ENABLED for %s (handle %d)", char_name, param->write.handle);
+                } else if (descr_value == 0x0000) {
+                    ESP_LOGI(GATTS_TAG, "Notifications/Indications DISABLED for %s (handle %d)", char_name, param->write.handle);
+                }
+            }
+
+            // Send write response if needed
+            if (param->write.need_rsp) {
+                ESP_LOGI(GATTS_TAG, "Sending write response");
+                esp_ble_gatts_send_response(gatts_if, param->write.conn_id, param->write.trans_id,
+                                             ESP_GATT_OK, NULL);
+            }
+            break;
+
         case ESP_GATTS_CONF_EVT:
             // Confirmation received for indication
             break;
@@ -1029,22 +1188,23 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
     }
 }
 
-// Send IMU batch data over BLE (fragments into MTU-sized packets)
-esp_err_t ble_send_imu_batch(imu_sample_t *samples, size_t count)
+// Send combined IMU batch data over BLE (fragments into MTU-sized packets)
+// Sends all 3 IMU channels in one characteristic for maximum efficiency
+esp_err_t ble_send_combined_imu_batch(combined_imu_sample_t *samples, size_t count)
 {
-    if (!ble_is_connected || samples == NULL || count == 0) {
+    if (!ble_is_connected || !ble_characteristics_ready || samples == NULL || count == 0) {
         return ESP_FAIL;
     }
 
     // Calculate total data size
-    size_t total_size = count * sizeof(imu_sample_t);
+    size_t total_size = count * sizeof(combined_imu_sample_t);
     uint8_t *data_ptr = (uint8_t *)samples;
 
     // Lightweight logging - only log occasionally to avoid watchdog timeout
     static uint32_t log_counter = 0;
     if (log_counter++ % 100 == 0) {
-        ESP_LOGI(GATTS_TAG, "BLE: %zu samples * %zu bytes = %zu total",
-                 count, sizeof(imu_sample_t), total_size);
+        ESP_LOGI(GATTS_TAG, "BLE Combined IMU: %zu samples * %zu bytes = %zu total",
+                 count, sizeof(combined_imu_sample_t), total_size);
     }
 
     // MTU overhead: 3 bytes for ATT header
@@ -1058,7 +1218,7 @@ esp_err_t ble_send_imu_batch(imu_sample_t *samples, size_t count)
         esp_err_t ret = esp_ble_gatts_send_indicate(ble_gatts_if, ble_conn_id, imu_data_handle,
                                                       chunk_size, data_ptr + sent, false);
         if (ret != ESP_OK) {
-            ESP_LOGW(GATTS_TAG, "Failed to send IMU data chunk, error=0x%x", ret);
+            ESP_LOGW(GATTS_TAG, "Failed to send combined IMU data chunk, error=0x%x", ret);
             return ret;
         }
 
@@ -1113,7 +1273,7 @@ esp_err_t ble_init(void)
     ESP_LOGI(GATTS_TAG, "╚════════════════════════════════════════════════╝");
     ESP_LOGI(GATTS_TAG, "Device Name: %s", DEVICE_NAME);
     ESP_LOGI(GATTS_TAG, "Service UUID: 0x%04X", GATTS_SERVICE_UUID_DATALOGGER);
-    ESP_LOGI(GATTS_TAG, "IMU Characteristic UUID: 0x%04X", GATTS_CHAR_UUID_IMU_DATA);
+    ESP_LOGI(GATTS_TAG, "Combined IMU Characteristic UUID: 0x%04X (all 3 channels)", GATTS_CHAR_UUID_IMU_DATA);
     ESP_LOGI(GATTS_TAG, "GPS Characteristic UUID: 0x%04X", GATTS_CHAR_UUID_GPS_DATA);
     ESP_LOGI(GATTS_TAG, "");
 
@@ -1217,15 +1377,21 @@ esp_err_t ble_init(void)
 // ============================================================================
 void app_main(void)
 {
+    // Reduce SPI driver log verbosity to avoid spam from SD card operations
+    esp_log_level_set("spi_master", ESP_LOG_INFO);
+
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "╔════════════════════════════════════════════════╗");
     ESP_LOGI(TAG, "║     DATALOGGER V2 - XIAO ESP32-C6              ║");
     ESP_LOGI(TAG, "╚════════════════════════════════════════════════╝");
+#ifdef ENABLE_I2C_SENSORS
     ESP_LOGI(TAG, "DEBUG: sizeof(imu_sample_t) = %zu bytes", sizeof(imu_sample_t));
+    ESP_LOGI(TAG, "DEBUG: sizeof(combined_imu_sample_t) = %zu bytes (3 IMUs)", sizeof(combined_imu_sample_t));
     ESP_LOGI(TAG, "DEBUG: sizeof(int64_t) = %zu, sizeof(float) = %zu", sizeof(int64_t), sizeof(float));
+#endif
     ESP_LOGI(TAG, "Enabled modules:");
 #ifdef ENABLE_I2C_SENSORS
-    ESP_LOGI(TAG, "  ✓ I2C Sensors (BMI160 IMU via PCA9548A mux)");
+    ESP_LOGI(TAG, "  ✓ I2C Sensors (3x BMI160 IMUs @ 800Hz via PCA9548A mux)");
 #else
     ESP_LOGI(TAG, "  ✗ I2C Sensors (disabled)");
 #endif
@@ -1270,7 +1436,7 @@ void app_main(void)
 
 #ifdef ENABLE_I2C_SENSORS
     // Create queue for IMU samples
-    imu_queue = xQueueCreate(IMU_QUEUE_SIZE, sizeof(imu_sample_t));
+    imu_queue = xQueueCreate(IMU_QUEUE_SIZE, sizeof(combined_imu_sample_t));
     if (imu_queue == NULL) {
         ESP_LOGE(TAG, "Failed to create IMU queue");
     } else {
@@ -1279,8 +1445,9 @@ void app_main(void)
         // Create high-priority sensor polling task (priority 10)
         xTaskCreate(bmi160_sensor_task, "sensor_poll", configMINIMAL_STACK_SIZE * 8, NULL, 10, &sensor_task_handle);
 
-        // Create low-priority data writer task (priority 3) for SD
-        #ifdef ENABLE_SD_CARD
+        // Create low-priority data writer task (priority 3) for SD and/or BLE
+        // This task drains the IMU queue, so it's needed even if only BLE is enabled
+        #if defined(ENABLE_SD_CARD) || defined(ENABLE_BLUETOOTH)
         xTaskCreate(data_writer_task, "data_writer", configMINIMAL_STACK_SIZE * 10, NULL, 3, &sd_writer_task_handle);
         #endif
     }
