@@ -687,3 +687,133 @@ esp_err_t bmi160_read_tap_orient(bmi160_t *dev, uint8_t *orient)
     *orient = data;
     return ESP_OK;
 }
+
+// ============================================================================
+// FIFO Mode Functions
+// ============================================================================
+
+esp_err_t bmi160_enable_fifo(bmi160_t *dev, bool enable_header, bool enable_time)
+{
+    // Configure FIFO_CONFIG_1 register (0x47)
+    // Bit 7: gyr_fifo_en (enable gyroscope data in FIFO)
+    // Bit 6: acc_fifo_en (enable accelerometer data in FIFO)
+    // Bit 4: fifo_header_en (enable header mode)
+    // Bit 1: fifo_time_en (enable timestamp frames)
+
+    uint8_t config = 0;
+    config |= (1 << 7);  // Enable gyroscope FIFO
+    config |= (1 << 6);  // Enable accelerometer FIFO
+
+    if (enable_header) {
+        config |= (1 << 4);  // Enable header mode
+    }
+
+    if (enable_time) {
+        config |= (1 << 1);  // Enable timestamp frames
+    }
+
+    ESP_LOGI(TAG, "Enabling FIFO mode: header=%d, time=%d, config=0x%02X",
+             enable_header, enable_time, config);
+
+    return bmi160_write_reg(dev, BMI160_FIFO_CONFIG_1, config);
+}
+
+esp_err_t bmi160_disable_fifo(bmi160_t *dev)
+{
+    // Write 0x00 to FIFO_CONFIG_1 to disable all FIFO features
+    ESP_LOGI(TAG, "Disabling FIFO mode");
+    return bmi160_write_reg(dev, BMI160_FIFO_CONFIG_1, 0x00);
+}
+
+esp_err_t bmi160_set_fifo_watermark(bmi160_t *dev, uint16_t watermark)
+{
+    // FIFO watermark is 10 bits (max 1023)
+    if (watermark > 1023) {
+        ESP_LOGW(TAG, "Watermark %d exceeds max 1023, clamping", watermark);
+        watermark = 1023;
+    }
+
+    // FIFO_CONFIG_0 (0x46) contains lower 8 bits of watermark
+    uint8_t config0 = watermark & 0xFF;
+
+    ESP_LOGI(TAG, "Setting FIFO watermark to %d bytes", watermark);
+
+    return bmi160_write_reg(dev, BMI160_FIFO_CONFIG_0, config0);
+}
+
+esp_err_t bmi160_get_fifo_length(bmi160_t *dev, uint16_t *length)
+{
+    uint8_t data[2];
+    esp_err_t ret;
+
+    // Read FIFO_LENGTH registers (0x22-0x23)
+    // FIFO_LENGTH_0 (0x22): bits 7:0 of length
+    // FIFO_LENGTH_1 (0x23): bits 10:8 of length (11-bit total)
+
+    I2C_DEV_TAKE_MUTEX(&dev->i2c_dev);
+    ret = i2c_dev_read_reg(&dev->i2c_dev, BMI160_FIFO_LENGTH_0, data, 2);
+    I2C_DEV_GIVE_MUTEX(&dev->i2c_dev);
+
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to read FIFO length");
+        return ret;
+    }
+
+    // Combine into 11-bit value
+    *length = data[0] | ((uint16_t)(data[1] & 0x07) << 8);
+
+    return ESP_OK;
+}
+
+esp_err_t bmi160_read_sensor_time(bmi160_t *dev, uint32_t *sensor_time)
+{
+    uint8_t data[3];
+    esp_err_t ret;
+
+    // Read SENSOR_TIME registers (0x18-0x1A)
+    // 24-bit value, LSB first
+
+    I2C_DEV_TAKE_MUTEX(&dev->i2c_dev);
+    ret = i2c_dev_read_reg(&dev->i2c_dev, BMI160_SENSOR_TIME_L, data, 3);
+    I2C_DEV_GIVE_MUTEX(&dev->i2c_dev);
+
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to read sensor time");
+        return ret;
+    }
+
+    // Combine into 24-bit value
+    *sensor_time = data[0] | ((uint32_t)data[1] << 8) | ((uint32_t)data[2] << 16);
+
+    return ESP_OK;
+}
+
+esp_err_t bmi160_read_fifo_data(bmi160_t *dev, uint8_t *data, uint16_t length)
+{
+    esp_err_t ret;
+
+    if (length == 0) {
+        return ESP_OK;
+    }
+
+    // Read from FIFO_DATA register (0x24)
+    // Reading this register automatically advances FIFO read pointer
+
+    I2C_DEV_TAKE_MUTEX(&dev->i2c_dev);
+    ret = i2c_dev_read_reg(&dev->i2c_dev, BMI160_FIFO_DATA, data, length);
+    I2C_DEV_GIVE_MUTEX(&dev->i2c_dev);
+
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to read FIFO data (%d bytes)", length);
+        return ret;
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t bmi160_flush_fifo(bmi160_t *dev)
+{
+    // Write 0xB0 to CMD register (0x7E) to flush FIFO
+    ESP_LOGI(TAG, "Flushing FIFO buffer");
+    return bmi160_write_reg(dev, BMI160_CMD, 0xB0);
+}

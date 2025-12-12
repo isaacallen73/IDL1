@@ -523,6 +523,76 @@ esp_err_t bmi160_enable_int_tap(bmi160_t *dev, bmi160_int_out_conf_t* intOutConf
  */
 esp_err_t bmi160_read_tap_orient(bmi160_t *dev, uint8_t *orient);
 
+/**
+ * @brief Enable FIFO mode with accelerometer and gyroscope data
+ *
+ * @param dev Pointer to the device descriptor
+ * @param enable_header Enable header mode (true recommended for robustness)
+ * @param enable_time Enable timestamp frames in FIFO
+ *
+ * @return esp_err_t ESP_OK if success
+ */
+esp_err_t bmi160_enable_fifo(bmi160_t *dev, bool enable_header, bool enable_time);
+
+/**
+ * @brief Disable FIFO mode
+ *
+ * @param dev Pointer to the device descriptor
+ *
+ * @return esp_err_t ESP_OK if success
+ */
+esp_err_t bmi160_disable_fifo(bmi160_t *dev);
+
+/**
+ * @brief Set FIFO watermark level
+ *
+ * @param dev Pointer to the device descriptor
+ * @param watermark Watermark level in bytes (0-1023)
+ *
+ * @return esp_err_t ESP_OK if success
+ */
+esp_err_t bmi160_set_fifo_watermark(bmi160_t *dev, uint16_t watermark);
+
+/**
+ * @brief Read FIFO length (number of bytes available)
+ *
+ * @param dev Pointer to the device descriptor
+ * @param length Pointer to store FIFO length
+ *
+ * @return esp_err_t ESP_OK if success
+ */
+esp_err_t bmi160_get_fifo_length(bmi160_t *dev, uint16_t *length);
+
+/**
+ * @brief Read sensor time (24-bit internal timer)
+ *
+ * @param dev Pointer to the device descriptor
+ * @param sensor_time Pointer to store sensor time (24-bit value)
+ *
+ * @return esp_err_t ESP_OK if success
+ */
+esp_err_t bmi160_read_sensor_time(bmi160_t *dev, uint32_t *sensor_time);
+
+/**
+ * @brief Read raw FIFO data
+ *
+ * @param dev Pointer to the device descriptor
+ * @param data Buffer to store FIFO data
+ * @param length Number of bytes to read
+ *
+ * @return esp_err_t ESP_OK if success
+ */
+esp_err_t bmi160_read_fifo_data(bmi160_t *dev, uint8_t *data, uint16_t length);
+
+/**
+ * @brief Flush/clear FIFO buffer
+ *
+ * @param dev Pointer to the device descriptor
+ *
+ * @return esp_err_t ESP_OK if success
+ */
+esp_err_t bmi160_flush_fifo(bmi160_t *dev);
+
 #ifdef __cplusplus
 }
 #endif

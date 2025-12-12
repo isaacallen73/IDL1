@@ -58,15 +58,17 @@
 // Buffering Configuration for High-Speed Data Logging
 #define IMU_BUFFER_SIZE 512         // Number of samples to buffer (512 samples = ~320ms at 1600Hz)
 #define SD_BATCH_SIZE 256           // Write to SD every N samples (larger = more efficient for SD)
-#define BLE_BATCH_SIZE 16           // Send via BLE every N samples (512 bytes = fits in one MTU)
-#define IMU_QUEUE_SIZE 64           // FreeRTOS queue depth
+#define BLE_BATCH_SIZE 20           // Send via BLE every N samples (fits in 1 MTU: 20 × 25 bytes = 500 bytes < 509 usable MTU)
+#define IMU_QUEUE_SIZE 128          // FreeRTOS queue depth (increased for FIFO mode buffering)
+#define BLE_QUEUE_SIZE 128          // Separate queue for BLE transmission (must handle 2400 samples/sec)
 
 // IMU Sample Structure - stores one timestamped sensor reading from a single IMU
+// Using raw int16 values to minimize BLE bandwidth and avoid float conversion overhead
 // __attribute__((packed)) ensures no padding bytes are added
 typedef struct __attribute__((packed)) {
     int64_t timestamp_us;  // Microsecond timestamp
-    float accX, accY, accZ;
-    float gyroX, gyroY, gyroZ;
+    int16_t accX, accY, accZ;   // Raw accelerometer (convert with: value * 2.0 / 16384.0 for ±2g)
+    int16_t gyroX, gyroY, gyroZ; // Raw gyroscope (convert with: value * 125.0 / 262.4 for ±125dps)
 } imu_sample_t;
 
 // Combined IMU Sample Structure - stores readings from all 3 IMUs at once
@@ -77,13 +79,47 @@ typedef struct __attribute__((packed)) {
     imu_sample_t imu4;     // Data from IMU on channel 4
 } combined_imu_sample_t;
 
-// Global queue for passing combined samples from sensor task to SD task
-static QueueHandle_t imu_queue = NULL;
+// FIFO Configuration and Constants
+#define FIFO_MAX_SIZE 1024                  // BMI160 FIFO buffer size in bytes
+#define FIFO_FRAME_SIZE_HEADERLESS 12       // Accel (6) + Gyro (6) bytes
+#define FIFO_FRAME_SIZE_HEADER 13           // Header (1) + Accel (6) + Gyro (6) bytes
+#define FIFO_POLL_INTERVAL_MS 15            // Poll FIFO every 15ms (~12 samples/IMU per read, prevents overflow with BLE active)
+#define FIFO_MAX_FRAMES 78                  // ~1024 / 13 bytes per frame
+#define SENSOR_TIME_TICK_US 39.0625         // BMI160 sensor time resolution (microseconds per tick)
+
+// FIFO Frame Header Values (from BMI160 datasheet)
+#define FIFO_HEADER_ACCEL_GYRO 0x8C         // Both accelerometer and gyroscope data
+#define FIFO_HEADER_GYRO_ONLY  0x88         // Gyroscope only
+#define FIFO_HEADER_ACCEL_ONLY 0x84         // Accelerometer only
+#define FIFO_HEADER_SENSOR_TIME 0x44        // Timestamp frame
+#define FIFO_HEADER_SKIP 0x40               // Skip frame (FIFO was full)
+#define FIFO_HEADER_CONFIG 0x48             // Configuration change
+
+// Timestamped IMU Sample - includes both ESP32 and BMI160 timestamps for synchronization
+typedef struct __attribute__((packed)) {
+    uint8_t imu_id;                // IMU identifier (0, 1, or 2)
+    int64_t esp32_time_us;         // ESP32 timestamp for cross-sensor alignment
+    uint32_t sensor_time_ticks;    // BMI160 internal time for intra-sensor interpolation
+    int16_t accel[3];              // Raw accelerometer data (X, Y, Z)
+    int16_t gyro[3];               // Raw gyroscope data (X, Y, Z)
+} timestamped_imu_sample_t;
+
+// Global queues for inter-task communication
+static QueueHandle_t imu_queue = NULL;     // Sensor task → SD writer task (timestamped_imu_sample_t)
+static QueueHandle_t ble_queue = NULL;     // SD writer task → BLE task (combined_imu_sample_t)
 
 // Static buffers for data_writer_task (to avoid stack overflow)
 // Allocated in global memory instead of on task stack
 static combined_imu_sample_t batch_buffer[SD_BATCH_SIZE];
 static combined_imu_sample_t ble_batch_buffer[BLE_BATCH_SIZE];  // BLE uses combined samples directly
+
+// FIFO parsing buffer (allocate once, reuse for all reads)
+static uint8_t fifo_buffer[FIFO_MAX_SIZE + 4];  // +4 for timestamp frame
+
+// Forward declarations for FIFO parsing functions
+int parse_fifo_frames(uint8_t *fifo_data, uint16_t fifo_len, uint8_t imu_id,
+                      int64_t read_timestamp_us, timestamped_imu_sample_t *samples,
+                      int max_samples);
 
 #endif
 
@@ -188,6 +224,7 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
 static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param);
 esp_err_t ble_init(void);
 esp_err_t ble_send_combined_imu_batch(combined_imu_sample_t *samples, size_t count);
+esp_err_t ble_send_timestamped_imu_batch(timestamped_imu_sample_t *samples, size_t count);
 esp_err_t ble_send_gps_data(const char *nmea_sentence);
 
 #endif // ENABLE_BLUETOOTH
@@ -195,12 +232,125 @@ esp_err_t ble_send_gps_data(const char *nmea_sentence);
 static const char *TAG = "DATALOGGER";
 
 // ============================================================================
-// I2C SENSOR CODE - High-Speed Buffered Polling
+// I2C SENSOR CODE - FIFO-Based Buffered Acquisition
 // ============================================================================
 #ifdef ENABLE_I2C_SENSORS
 
 TaskHandle_t sensor_task_handle = NULL;
 TaskHandle_t sd_writer_task_handle = NULL;
+TaskHandle_t ble_sender_task_handle = NULL;
+
+// ============================================================================
+// FIFO Parsing Functions
+// ============================================================================
+
+/**
+ * @brief Parse FIFO frames from BMI160 with header mode and timestamp support
+ *
+ * @param fifo_data Raw FIFO data buffer
+ * @param fifo_len Length of FIFO data in bytes
+ * @param imu_id IMU identifier (0, 1, or 2)
+ * @param read_timestamp_us ESP32 timestamp when FIFO was read
+ * @param samples Output buffer for parsed samples
+ * @param max_samples Maximum number of samples to parse
+ * @return Number of samples parsed
+ */
+int parse_fifo_frames(uint8_t *fifo_data, uint16_t fifo_len, uint8_t imu_id,
+                      int64_t read_timestamp_us, timestamped_imu_sample_t *samples,
+                      int max_samples)
+{
+    int sample_count = 0;
+    uint32_t last_sensor_time = 0;
+    bool found_timestamp = false;
+    int pos = 0;
+
+    // First pass: find timestamp frame at the end (if present)
+    // Read backwards through buffer looking for timestamp header 0x44
+    for (int i = fifo_len - 4; i >= 0; i--) {
+        if (fifo_data[i] == FIFO_HEADER_SENSOR_TIME && i + 3 < fifo_len) {
+            // Extract 24-bit sensor time (LSB first)
+            last_sensor_time = fifo_data[i+1] |
+                             ((uint32_t)fifo_data[i+2] << 8) |
+                             ((uint32_t)fifo_data[i+3] << 16);
+            found_timestamp = true;
+            ESP_LOGD(TAG, "IMU %d: Found timestamp frame at offset %d, sensor_time=%lu",
+                     imu_id, i, last_sensor_time);
+            break;
+        }
+    }
+
+    // Second pass: parse data frames
+    while (pos < fifo_len && sample_count < max_samples) {
+        uint8_t header = fifo_data[pos];
+
+        // Check for timestamp frame (skip it, already extracted)
+        if (header == FIFO_HEADER_SENSOR_TIME) {
+            pos += 4;  // Header + 3 bytes of timestamp
+            continue;
+        }
+
+        // Check for skip frame (FIFO overflow)
+        if (header == FIFO_HEADER_SKIP) {
+            ESP_LOGW(TAG, "IMU %d: FIFO skip frame detected (overflow!)", imu_id);
+            pos += 1;
+            continue;
+        }
+
+        // Check for config change frame
+        if (header == FIFO_HEADER_CONFIG) {
+            ESP_LOGD(TAG, "IMU %d: Config change frame", imu_id);
+            pos += 1;
+            continue;
+        }
+
+        // Parse accel+gyro frame (header 0x8C)
+        if (header == FIFO_HEADER_ACCEL_GYRO) {
+            if (pos + 13 > fifo_len) {
+                ESP_LOGW(TAG, "IMU %d: Incomplete frame at end of FIFO", imu_id);
+                break;  // Incomplete frame
+            }
+
+            // Extract raw sensor data (12 bytes after header)
+            // Gyro X, Y, Z (bytes 1-6), Accel X, Y, Z (bytes 7-12)
+            samples[sample_count].gyro[0] = (int16_t)(fifo_data[pos+1] | (fifo_data[pos+2] << 8));
+            samples[sample_count].gyro[1] = (int16_t)(fifo_data[pos+3] | (fifo_data[pos+4] << 8));
+            samples[sample_count].gyro[2] = (int16_t)(fifo_data[pos+5] | (fifo_data[pos+6] << 8));
+
+            samples[sample_count].accel[0] = (int16_t)(fifo_data[pos+7] | (fifo_data[pos+8] << 8));
+            samples[sample_count].accel[1] = (int16_t)(fifo_data[pos+9] | (fifo_data[pos+10] << 8));
+            samples[sample_count].accel[2] = (int16_t)(fifo_data[pos+11] | (fifo_data[pos+12] << 8));
+
+            samples[sample_count].imu_id = imu_id;
+
+            // Interpolate timestamp if we have sensor_time
+            if (found_timestamp) {
+                // Calculate how many samples back from the last one (which has last_sensor_time)
+                int samples_from_end = (fifo_len - pos - 13) / 13;  // Remaining frames after this one
+
+                // Interpolate sensor time backwards (800Hz = 32 ticks per sample)
+                uint32_t sample_sensor_time = last_sensor_time - (samples_from_end * 32);
+                samples[sample_count].sensor_time_ticks = sample_sensor_time;
+
+                // Interpolate ESP32 timestamp backwards (800Hz = 1250µs per sample)
+                int64_t time_offset_us = samples_from_end * 1250;
+                samples[sample_count].esp32_time_us = read_timestamp_us - time_offset_us;
+            } else {
+                // No timestamp available, just use read time
+                samples[sample_count].sensor_time_ticks = 0;
+                samples[sample_count].esp32_time_us = read_timestamp_us;
+            }
+
+            sample_count++;
+            pos += 13;  // Move to next frame
+        } else {
+            // Unknown header - skip byte and continue
+            ESP_LOGW(TAG, "IMU %d: Unknown FIFO header 0x%02X at pos %d", imu_id, header, pos);
+            pos++;
+        }
+    }
+
+    return sample_count;
+}
 
 // High-priority sensor polling task
 void bmi160_sensor_task(void *pvParameters)
@@ -271,118 +421,150 @@ void bmi160_sensor_task(void *pvParameters)
 
     ESP_LOGI(TAG, "All 3 BMI160 sensors initialized at 800Hz ODR");
 
+    // Enable FIFO mode on all 3 IMUs (header mode + timestamp)
+    ESP_LOGI(TAG, "Enabling FIFO mode with headers and timestamps...");
+
+    channel_mask = PCA9548A_CHANNEL(BMI160_MUX_CHANNEL_2);
+    ESP_ERROR_CHECK(i2c_dev_write(&mux_dev, NULL, 0, &channel_mask, 1));
+    ESP_ERROR_CHECK(bmi160_enable_fifo(&bmi160_dev_ch2, true, true));  // header=true, time=true
+
+    channel_mask = PCA9548A_CHANNEL(BMI160_MUX_CHANNEL_3);
+    ESP_ERROR_CHECK(i2c_dev_write(&mux_dev, NULL, 0, &channel_mask, 1));
+    ESP_ERROR_CHECK(bmi160_enable_fifo(&bmi160_dev_ch3, true, true));
+
+    channel_mask = PCA9548A_CHANNEL(BMI160_MUX_CHANNEL_4);
+    ESP_ERROR_CHECK(i2c_dev_write(&mux_dev, NULL, 0, &channel_mask, 1));
+    ESP_ERROR_CHECK(bmi160_enable_fifo(&bmi160_dev_ch4, true, true));
+
+    ESP_LOGI(TAG, "FIFO mode enabled on all 3 IMUs");
+
     // Performance measurement variables
-    uint32_t sample_count = 0;
+    uint32_t total_samples = 0;
+    uint32_t fifo_overflow_count = 0;
     uint32_t error_count = 0;
-    uint32_t queue_full_count = 0;
     int64_t start_time = esp_timer_get_time();
     int64_t last_report_time = start_time;
 
-    // Main sensor reading loop - poll all 3 IMUs sequentially
+    // Temporary buffer for parsing FIFO frames from one IMU at a time
+    static timestamped_imu_sample_t temp_samples[FIFO_MAX_FRAMES];
+
+    // Main FIFO polling loop - reads buffered samples periodically
+    ESP_LOGI(TAG, "Starting FIFO polling loop (interval: %dms)", FIFO_POLL_INTERVAL_MS);
+
     while (1) {
-        bmi160_result_t result_ch2, result_ch3, result_ch4;
-        int64_t timestamp = esp_timer_get_time();
-        bool all_success = true;
+        int64_t loop_start = esp_timer_get_time();
 
-        // Read from channel 2
-        channel_mask = PCA9548A_CHANNEL(BMI160_MUX_CHANNEL_2);
-        i2c_dev_write(&mux_dev, NULL, 0, &channel_mask, 1);
-        if (bmi160_read_data(&bmi160_dev_ch2, &result_ch2) != ESP_OK) {
-            error_count++;
-            all_success = false;
-        }
+        // Read FIFO from all 3 IMUs sequentially and send immediately
+        for (int imu_idx = 0; imu_idx < 3; imu_idx++) {
+            uint8_t mux_channel = (imu_idx == 0) ? BMI160_MUX_CHANNEL_2 :
+                                 (imu_idx == 1) ? BMI160_MUX_CHANNEL_3 :
+                                                  BMI160_MUX_CHANNEL_4;
 
-        // Read from channel 3
-        channel_mask = PCA9548A_CHANNEL(BMI160_MUX_CHANNEL_3);
-        i2c_dev_write(&mux_dev, NULL, 0, &channel_mask, 1);
-        if (bmi160_read_data(&bmi160_dev_ch3, &result_ch3) != ESP_OK) {
-            error_count++;
-            all_success = false;
-        }
+            bmi160_t *imu_dev = (imu_idx == 0) ? &bmi160_dev_ch2 :
+                                (imu_idx == 1) ? &bmi160_dev_ch3 :
+                                                 &bmi160_dev_ch4;
 
-        // Read from channel 4
-        channel_mask = PCA9548A_CHANNEL(BMI160_MUX_CHANNEL_4);
-        i2c_dev_write(&mux_dev, NULL, 0, &channel_mask, 1);
-        if (bmi160_read_data(&bmi160_dev_ch4, &result_ch4) != ESP_OK) {
-            error_count++;
-            all_success = false;
-        }
+            // Select IMU via multiplexer
+            channel_mask = PCA9548A_CHANNEL(mux_channel);
+            if (i2c_dev_write(&mux_dev, NULL, 0, &channel_mask, 1) != ESP_OK) {
+                ESP_LOGW(TAG, "IMU %d: Failed to select multiplexer channel", imu_idx);
+                error_count++;
+                continue;
+            }
 
-        if (all_success) {
-            sample_count++;
+            // Read FIFO length
+            uint16_t fifo_len = 0;
+            if (bmi160_get_fifo_length(imu_dev, &fifo_len) != ESP_OK) {
+                ESP_LOGW(TAG, "IMU %d: Failed to read FIFO length", imu_idx);
+                error_count++;
+                continue;
+            }
 
-            // Create combined timestamped sample with all 3 IMUs
-            combined_imu_sample_t combined_sample;
-            combined_sample.timestamp_us = timestamp;
+            // Skip if FIFO is empty
+            if (fifo_len == 0) {
+                continue;
+            }
 
-            // IMU channel 2 data
-            combined_sample.imu2.timestamp_us = timestamp;
-            combined_sample.imu2.accX = result_ch2.accX;
-            combined_sample.imu2.accY = result_ch2.accY;
-            combined_sample.imu2.accZ = result_ch2.accZ;
-            combined_sample.imu2.gyroX = result_ch2.gyroX;
-            combined_sample.imu2.gyroY = result_ch2.gyroY;
-            combined_sample.imu2.gyroZ = result_ch2.gyroZ;
+            // Check for FIFO overflow
+            if (fifo_len >= 1000) {
+                ESP_LOGW(TAG, "IMU %d: FIFO near full (%d bytes) - possible overflow!", imu_idx, fifo_len);
+                fifo_overflow_count++;
+            }
 
-            // IMU channel 3 data
-            combined_sample.imu3.timestamp_us = timestamp;
-            combined_sample.imu3.accX = result_ch3.accX;
-            combined_sample.imu3.accY = result_ch3.accY;
-            combined_sample.imu3.accZ = result_ch3.accZ;
-            combined_sample.imu3.gyroX = result_ch3.gyroX;
-            combined_sample.imu3.gyroY = result_ch3.gyroY;
-            combined_sample.imu3.gyroZ = result_ch3.gyroZ;
+            // Read FIFO data + timestamp frame (add 4 bytes for timestamp)
+            uint16_t read_len = (fifo_len + 4 > FIFO_MAX_SIZE + 4) ? FIFO_MAX_SIZE : fifo_len + 4;
 
-            // IMU channel 4 data
-            combined_sample.imu4.timestamp_us = timestamp;
-            combined_sample.imu4.accX = result_ch4.accX;
-            combined_sample.imu4.accY = result_ch4.accY;
-            combined_sample.imu4.accZ = result_ch4.accZ;
-            combined_sample.imu4.gyroX = result_ch4.gyroX;
-            combined_sample.imu4.gyroY = result_ch4.gyroY;
-            combined_sample.imu4.gyroZ = result_ch4.gyroZ;
+            if (bmi160_read_fifo_data(imu_dev, fifo_buffer, read_len) != ESP_OK) {
+                ESP_LOGW(TAG, "IMU %d: Failed to read FIFO data", imu_idx);
+                error_count++;
+                continue;
+            }
 
-            // Send to queue (non-blocking to avoid slowing down sensor polling)
-            if (imu_queue != NULL) {
-                if (xQueueSend(imu_queue, &combined_sample, 0) != pdTRUE) {
-                    queue_full_count++;  // Queue full - sample dropped
+            // Capture timestamp immediately after FIFO read
+            int64_t read_timestamp = esp_timer_get_time();
+
+            // Parse FIFO frames
+            int num_samples = parse_fifo_frames(fifo_buffer, fifo_len, imu_idx,
+                                               read_timestamp, temp_samples, FIFO_MAX_FRAMES);
+
+            // If we got very few or no samples from a large FIFO, it's likely corrupted
+            // This can happen when BLE causes timing issues or FIFO overflows
+            if (num_samples == 0 && fifo_len > 50) {
+                ESP_LOGW(TAG, "IMU %d: Failed to parse %d bytes of FIFO (corrupted data), flushing FIFO...",
+                         imu_idx, fifo_len);
+                bmi160_flush_fifo(imu_dev);
+                error_count++;
+                continue;
+            }
+
+            if (num_samples > 0) {
+                ESP_LOGD(TAG, "IMU %d: Parsed %d samples from %d bytes of FIFO",
+                         imu_idx, num_samples, fifo_len);
+                total_samples += num_samples;
+
+                // Send individual timestamped samples to queue immediately
+                // Don't wait to combine - let data_writer_task handle alignment
+                if (imu_queue != NULL) {
+                    for (int i = 0; i < num_samples; i++) {
+                        if (xQueueSend(imu_queue, &temp_samples[i], 0) != pdTRUE) {
+                            ESP_LOGD(TAG, "Queue full, sample dropped");
+                            break;
+                        }
+                    }
                 }
             }
-
-            // Print every 500th sample to reduce serial overhead
-            /*
-            if (sample_count % 500 == 0) {
-                ESP_LOGI(TAG, "Sample %lu: CH2 Acc[%+.3f %+.3f %+.3f]",
-                         sample_count, result_ch2.accX, result_ch2.accY, result_ch2.accZ);
-                ESP_LOGI(TAG, "Sample %lu: CH3 Acc[%+.3f %+.3f %+.3f]",
-                         sample_count, result_ch3.accX, result_ch3.accY, result_ch3.accZ);
-                ESP_LOGI(TAG, "Sample %lu: CH4 Acc[%+.3f %+.3f %+.3f]",
-                         sample_count, result_ch4.accX, result_ch4.accY, result_ch4.accZ);
-            }
-            */
         }
 
-        // Report polling rate every second
+        // Report performance every second
         int64_t current_time = esp_timer_get_time();
         if (current_time - last_report_time >= 1000000) {
             float elapsed_sec = (current_time - start_time) / 1000000.0;
-            float avg_rate = sample_count / elapsed_sec;
-            float interval_rate = sample_count / ((current_time - last_report_time) / 1000000.0);
+            float avg_rate = total_samples / elapsed_sec;
+            float expected_rate = 800.0 * 3;  // 800 Hz × 3 IMUs = 2400 Hz
 
-            ESP_LOGI(TAG, "═══ SENSOR PERFORMANCE ═══");
-            ESP_LOGI(TAG, "Samples: %lu | Errors: %lu | Dropped: %lu", sample_count, error_count, queue_full_count);
-            ESP_LOGI(TAG, "Avg rate: %.1f Hz | Current: %.1f Hz", avg_rate, interval_rate);
-            if (imu_queue != NULL) {
-                ESP_LOGI(TAG, "Queue: %d/%d items", uxQueueMessagesWaiting(imu_queue), IMU_QUEUE_SIZE);
-            }
-            ESP_LOGI(TAG, "═════════════════════════");
+            ESP_LOGI(TAG, "═══ FIFO PERFORMANCE ═══");
+            ESP_LOGI(TAG, "Total samples: %lu | Errors: %lu | Overflows: %lu",
+                     total_samples, error_count, fifo_overflow_count);
+            ESP_LOGI(TAG, "Sample rate: %.1f Hz (expected: %.1f Hz) - %.1f%%",
+                     avg_rate, expected_rate, (avg_rate / expected_rate) * 100.0);
+            ESP_LOGI(TAG, "═══════════════════════");
 
-            // Reset for next interval
-            sample_count = 0;
+            // Reset counters for next interval
+            total_samples = 0;
             error_count = 0;
-            queue_full_count = 0;
+            fifo_overflow_count = 0;
             last_report_time = current_time;
             start_time = current_time;
+        }
+
+        // Sleep until next poll interval
+        int64_t elapsed = esp_timer_get_time() - loop_start;
+        int64_t sleep_time = (FIFO_POLL_INTERVAL_MS * 1000) - elapsed;
+
+        if (sleep_time > 0) {
+            vTaskDelay(pdMS_TO_TICKS(sleep_time / 1000));
+        } else {
+            ESP_LOGW(TAG, "Loop overrun by %lld µs!", -sleep_time);
         }
     }
 
@@ -396,82 +578,121 @@ void bmi160_sensor_task(void *pvParameters)
 #if defined(ENABLE_SD_CARD) || defined(ENABLE_BLUETOOTH)
 void data_writer_task(void *pvParameters)
 {
-    // Buffers are now statically allocated to avoid stack overflow
-    // See global declarations above
-    size_t batch_count = 0;
+    // Static buffers for batching timestamped samples
+    static timestamped_imu_sample_t sd_batch[SD_BATCH_SIZE];
+    static timestamped_imu_sample_t ble_batch[BLE_BATCH_SIZE];
+    size_t sd_batch_count = 0;
     size_t ble_batch_count = 0;
     uint32_t total_written = 0;
 
-    ESP_LOGI(TAG, "SD writer task started (SD batch: %d, BLE batch: %d samples)", SD_BATCH_SIZE, BLE_BATCH_SIZE);
+    ESP_LOGI(TAG, "Data writer task started (SD batch: %d, BLE batch: %d samples)", SD_BATCH_SIZE, BLE_BATCH_SIZE);
 
     while (1) {
-        combined_imu_sample_t combined_sample;
+        timestamped_imu_sample_t sample;
 
-        // Wait for combined samples from queue (with 1 second timeout)
-        if (xQueueReceive(imu_queue, &combined_sample, pdMS_TO_TICKS(1000)) == pdTRUE) {
-            // Add to batch buffers (SD and BLE use same combined sample structure)
-            batch_buffer[batch_count++] = combined_sample;
-            ble_batch_buffer[ble_batch_count++] = combined_sample;
+        // Wait for individual timestamped samples from queue (with 1 second timeout)
+        if (xQueueReceive(imu_queue, &sample, pdMS_TO_TICKS(1000)) == pdTRUE) {
+            // Add to SD batch buffer
+            sd_batch[sd_batch_count++] = sample;
 
-            // Send smaller batches over BLE for efficiency (every BLE_BATCH_SIZE samples)
+            // Add to BLE batch buffer
 #ifdef ENABLE_BLUETOOTH
+            ble_batch[ble_batch_count++] = sample;
+
+            // Send BLE batch when full
             if (ble_batch_count >= BLE_BATCH_SIZE) {
-                // Log sample values before sending
-                static uint32_t ble_send_count = 0;
-                if (ble_send_count++ % 20 == 0) {
-                    ESP_LOGI(TAG, "BLE Send - Combined[0]: CH2 Acc[%+.3f %+.3f %+.3f] CH3 Acc[%+.3f %+.3f %+.3f] CH4 Acc[%+.3f %+.3f %+.3f]",
-                             ble_batch_buffer[0].imu2.accX, ble_batch_buffer[0].imu2.accY, ble_batch_buffer[0].imu2.accZ,
-                             ble_batch_buffer[0].imu3.accX, ble_batch_buffer[0].imu3.accY, ble_batch_buffer[0].imu3.accZ,
-                             ble_batch_buffer[0].imu4.accX, ble_batch_buffer[0].imu4.accY, ble_batch_buffer[0].imu4.accZ);
+                // Send raw timestamped samples over BLE
+                if (ble_queue != NULL) {
+                    // Send batch to BLE queue (we'll update BLE task to handle timestamped samples)
+                    for (int i = 0; i < BLE_BATCH_SIZE; i++) {
+                        xQueueSend(ble_queue, &ble_batch[i], 0);
+                    }
                 }
-
-                // Send combined IMU data (all 3 channels in one characteristic)
-                esp_err_t ble_ret = ble_send_combined_imu_batch(ble_batch_buffer, BLE_BATCH_SIZE);
-                if (ble_ret != ESP_OK && ble_is_connected) {
-                    ESP_LOGW(TAG, "Failed to send combined IMU samples over BLE, error=0x%x", ble_ret);
-                } else if (ble_send_count % 20 == 0) {
-                    ESP_LOGI(TAG, "Combined IMU BLE send OK (%d samples, %zu bytes)",
-                             BLE_BATCH_SIZE, BLE_BATCH_SIZE * sizeof(combined_imu_sample_t));
-                }
-
-                ble_batch_count = 0;  // Reset BLE batch counter
+                ble_batch_count = 0;
             }
 #endif
 
-            // When batch is full, write to SD card
-            if (batch_count >= SD_BATCH_SIZE) {
+            // Write SD batch when full
+            if (sd_batch_count >= SD_BATCH_SIZE) {
 #ifdef ENABLE_SD_CARD
                 if (sd_card != NULL && data_log_file != NULL) {
-                    // Write combined samples as binary data
-                    size_t written = fwrite(batch_buffer, sizeof(combined_imu_sample_t), batch_count, data_log_file);
-                    if (written == batch_count) {
-                        total_written += batch_count;
-                        ESP_LOGI(TAG, "Wrote %d combined samples to SD (total: %lu)", batch_count, total_written);
+                    // Write timestamped samples as binary data
+                    size_t written = fwrite(sd_batch, sizeof(timestamped_imu_sample_t), SD_BATCH_SIZE, data_log_file);
+                    if (written == SD_BATCH_SIZE) {
+                        total_written += SD_BATCH_SIZE;
+                        ESP_LOGI(TAG, "Wrote %d timestamped samples to SD (total: %lu)", SD_BATCH_SIZE, total_written);
                     } else {
-                        ESP_LOGW(TAG, "Failed to write combined IMU batch to SD card");
+                        ESP_LOGW(TAG, "Failed to write IMU batch to SD card");
                     }
                 }
 #endif
-                batch_count = 0;  // Reset batch
+                sd_batch_count = 0;
             }
         } else {
             // Timeout - write partial batch to SD if any
-            if (batch_count > 0) {
+            if (sd_batch_count > 0) {
 #ifdef ENABLE_SD_CARD
                 if (sd_card != NULL && data_log_file != NULL) {
-                    size_t written = fwrite(batch_buffer, sizeof(combined_imu_sample_t), batch_count, data_log_file);
-                    if (written == batch_count) {
-                        total_written += batch_count;
-                        ESP_LOGI(TAG, "Wrote partial batch: %d samples (total: %lu)", batch_count, total_written);
+                    size_t written = fwrite(sd_batch, sizeof(timestamped_imu_sample_t), sd_batch_count, data_log_file);
+                    if (written == sd_batch_count) {
+                        total_written += sd_batch_count;
+                        ESP_LOGI(TAG, "Wrote partial batch: %d samples (total: %lu)", sd_batch_count, total_written);
                     }
                 }
 #endif
-                // Note: Don't send partial batches over BLE on timeout - BLE sends happen every BLE_BATCH_SIZE samples
-                batch_count = 0;
+                sd_batch_count = 0;
             }
         }
     }
 }
+
+// ============================================================================
+// BLE Sender Task - Dedicated task for BLE transmission (non-blocking)
+// ============================================================================
+#ifdef ENABLE_BLUETOOTH
+void ble_sender_task(void *pvParameters)
+{
+    ESP_LOGI(TAG, "BLE sender task started");
+    static timestamped_imu_sample_t ble_send_batch[BLE_BATCH_SIZE];
+    static size_t ble_batch_count = 0;
+
+    while (1) {
+        timestamped_imu_sample_t sample;
+
+        // Wait for samples from BLE queue (with 1 second timeout)
+        if (xQueueReceive(ble_queue, &sample, pdMS_TO_TICKS(1000)) == pdTRUE) {
+            // Add to BLE batch buffer
+            ble_send_batch[ble_batch_count++] = sample;
+
+            // Send when batch is full
+            if (ble_batch_count >= BLE_BATCH_SIZE) {
+                // Log sample values before sending (occasionally)
+                static uint32_t ble_send_count = 0;
+                if (ble_send_count++ % 20 == 0) {
+                    ESP_LOGI(TAG, "BLE Send - Sample[0]: IMU%d Acc[%d %d %d] Gyro[%d %d %d]",
+                             ble_send_batch[0].imu_id,
+                             ble_send_batch[0].accel[0], ble_send_batch[0].accel[1], ble_send_batch[0].accel[2],
+                             ble_send_batch[0].gyro[0], ble_send_batch[0].gyro[1], ble_send_batch[0].gyro[2]);
+                }
+
+                // Send timestamped IMU samples as binary data
+                // If BLE is congested, this will fail and drop the batch
+                esp_err_t ble_ret = ble_send_timestamped_imu_batch(ble_send_batch, BLE_BATCH_SIZE);
+
+                // Only log success occasionally to reduce console spam
+                if (ble_ret == ESP_OK && ble_send_count % 20 == 0) {
+                    ESP_LOGI(TAG, "BLE send OK (%d samples, %zu bytes)",
+                             BLE_BATCH_SIZE, BLE_BATCH_SIZE * sizeof(timestamped_imu_sample_t));
+                }
+                // Failures are logged inside ble_send_timestamped_imu_batch() with rate limiting
+
+                ble_batch_count = 0;  // Reset BLE batch counter regardless of success/failure
+            }
+        }
+        // If timeout occurs with no data, just continue waiting
+    }
+}
+#endif // ENABLE_BLUETOOTH
 #endif // ENABLE_SD_CARD || ENABLE_BLUETOOTH
 
 #endif // ENABLE_I2C_SENSORS
@@ -1224,8 +1445,45 @@ esp_err_t ble_send_combined_imu_batch(combined_imu_sample_t *samples, size_t cou
 
         sent += chunk_size;
 
-        // Small delay to avoid overwhelming the BLE stack (optional, tune as needed)
-        vTaskDelay(pdMS_TO_TICKS(1));
+        // Note: vTaskDelay removed - BLE stack can handle rapid sends
+        // With separate BLE task, blocking here doesn't affect sensor sampling
+    }
+
+    return ESP_OK;
+}
+
+// Send timestamped IMU samples over BLE (individual samples with IMU ID)
+esp_err_t ble_send_timestamped_imu_batch(timestamped_imu_sample_t *samples, size_t count)
+{
+    if (!ble_is_connected || !ble_characteristics_ready || samples == NULL || count == 0) {
+        return ESP_FAIL;
+    }
+
+    // Calculate total data size
+    size_t total_size = count * sizeof(timestamped_imu_sample_t);
+    uint8_t *data_ptr = (uint8_t *)samples;
+
+    // MTU overhead: 3 bytes for ATT header
+    size_t usable_mtu = ble_mtu - 3;
+
+    // Fragment and send data
+    size_t sent = 0;
+    while (sent < total_size) {
+        size_t chunk_size = (total_size - sent) > usable_mtu ? usable_mtu : (total_size - sent);
+
+        esp_err_t ret = esp_ble_gatts_send_indicate(ble_gatts_if, ble_conn_id, imu_data_handle,
+                                                      chunk_size, data_ptr + sent, false);
+        if (ret != ESP_OK) {
+            // BLE congestion or error - drop this batch to prevent blocking
+            // Only log occasionally to avoid flooding console
+            static uint32_t drop_count = 0;
+            if (++drop_count % 100 == 1) {
+                ESP_LOGW(GATTS_TAG, "BLE congested, dropped %lu batches", drop_count);
+            }
+            return ESP_FAIL;  // Return failure but don't log every time
+        }
+
+        sent += chunk_size;
     }
 
     return ESP_OK;
@@ -1436,11 +1694,24 @@ void app_main(void)
 
 #ifdef ENABLE_I2C_SENSORS
     // Create queue for IMU samples
-    imu_queue = xQueueCreate(IMU_QUEUE_SIZE, sizeof(combined_imu_sample_t));
+    imu_queue = xQueueCreate(IMU_QUEUE_SIZE, sizeof(timestamped_imu_sample_t));
     if (imu_queue == NULL) {
         ESP_LOGE(TAG, "Failed to create IMU queue");
     } else {
         ESP_LOGI(TAG, "Created IMU queue: %d slots", IMU_QUEUE_SIZE);
+
+        // Create BLE queue (separate from SD queue for decoupling)
+        #ifdef ENABLE_BLUETOOTH
+        ble_queue = xQueueCreate(BLE_QUEUE_SIZE, sizeof(timestamped_imu_sample_t));
+        if (ble_queue == NULL) {
+            ESP_LOGE(TAG, "Failed to create BLE queue");
+        } else {
+            ESP_LOGI(TAG, "Created BLE queue: %d slots", BLE_QUEUE_SIZE);
+
+            // Create BLE sender task (priority 2 - lower than SD writer)
+            xTaskCreate(ble_sender_task, "ble_sender", configMINIMAL_STACK_SIZE * 6, NULL, 2, &ble_sender_task_handle);
+        }
+        #endif
 
         // Create high-priority sensor polling task (priority 10)
         xTaskCreate(bmi160_sensor_task, "sensor_poll", configMINIMAL_STACK_SIZE * 8, NULL, 10, &sensor_task_handle);
