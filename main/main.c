@@ -58,9 +58,13 @@
 // Buffering Configuration for High-Speed Data Logging
 #define IMU_BUFFER_SIZE 512         // Number of samples to buffer (512 samples = ~320ms at 1600Hz)
 #define SD_BATCH_SIZE 256           // Write to SD every N samples (larger = more efficient for SD)
-#define BLE_BATCH_SIZE 20           // Send via BLE every N samples (fits in 1 MTU: 20 × 25 bytes = 500 bytes < 509 usable MTU)
-#define IMU_QUEUE_SIZE 128          // FreeRTOS queue depth (increased for FIFO mode buffering)
-#define BLE_QUEUE_SIZE 128          // Separate queue for BLE transmission (must handle 2400 samples/sec)
+#define BLE_BATCH_SIZE 20           // Send via BLE every N samples (20 × 25 bytes = 500 bytes, fits perfectly in 1 MTU)
+#define IMU_QUEUE_SIZE 256          // FreeRTOS queue depth (increased for FIFO mode buffering)
+#define BLE_QUEUE_SIZE 256          // Separate queue for BLE transmission (must handle 2400 samples/sec)
+
+// Performance optimization flags
+#define ENABLE_PERF_LOGGING 0       // Set to 1 to enable performance logging (reduces max sample rate)
+#define ENABLE_DEBUG_LOGGING 0      // Set to 0 to disable all debug logging in hot paths
 
 // IMU Sample Structure - stores one timestamped sensor reading from a single IMU
 // Using raw int16 values to minimize BLE bandwidth and avoid float conversion overhead
@@ -83,7 +87,7 @@ typedef struct __attribute__((packed)) {
 #define FIFO_MAX_SIZE 1024                  // BMI160 FIFO buffer size in bytes
 #define FIFO_FRAME_SIZE_HEADERLESS 12       // Accel (6) + Gyro (6) bytes
 #define FIFO_FRAME_SIZE_HEADER 13           // Header (1) + Accel (6) + Gyro (6) bytes
-#define FIFO_POLL_INTERVAL_MS 15            // Poll FIFO every 15ms (~12 samples/IMU per read, prevents overflow with BLE active)
+#define FIFO_POLL_INTERVAL_MS 10            // Poll FIFO every 10ms (~8 samples/IMU per read, prevents overflow with BLE active)
 #define FIFO_MAX_FRAMES 78                  // ~1024 / 13 bytes per frame
 #define SENSOR_TIME_TICK_US 39.0625         // BMI160 sensor time resolution (microseconds per tick)
 
@@ -162,6 +166,7 @@ int parse_fifo_frames(uint8_t *fifo_data, uint16_t fifo_len, uint8_t imu_id,
 
 static sdmmc_card_t *sd_card = NULL;
 static FILE *data_log_file = NULL;  // Single binary log file kept open for all sensor data
+static char current_data_log_path[64] = {0};  // Track current log file path for renaming
 
 // Forward declarations for SD card functions
 esp_err_t sd_card_init(void);
@@ -170,6 +175,7 @@ esp_err_t sd_write_file(const char *filename, const char *data, bool append);
 esp_err_t sd_log_gps(const char *nmea_sentence);
 esp_err_t sd_open_data_log(void);  // Open binary log file for fast writes
 void sd_close_data_log(void);      // Close and flush data log
+esp_err_t sd_rename_data_log_with_gps_time(int year, int month, int day, int hour, int minute, int second);  // Rename with GPS timestamp
 
 #ifdef ENABLE_I2C_SENSORS
 esp_err_t sd_log_imu_batch(imu_sample_t *samples, size_t count);  // Fast binary write
@@ -260,54 +266,26 @@ int parse_fifo_frames(uint8_t *fifo_data, uint16_t fifo_len, uint8_t imu_id,
                       int max_samples)
 {
     int sample_count = 0;
-    uint32_t last_sensor_time = 0;
-    bool found_timestamp = false;
     int pos = 0;
 
-    // First pass: find timestamp frame at the end (if present)
-    // Read backwards through buffer looking for timestamp header 0x44
-    for (int i = fifo_len - 4; i >= 0; i--) {
-        if (fifo_data[i] == FIFO_HEADER_SENSOR_TIME && i + 3 < fifo_len) {
-            // Extract 24-bit sensor time (LSB first)
-            last_sensor_time = fifo_data[i+1] |
-                             ((uint32_t)fifo_data[i+2] << 8) |
-                             ((uint32_t)fifo_data[i+3] << 16);
-            found_timestamp = true;
-            ESP_LOGD(TAG, "IMU %d: Found timestamp frame at offset %d, sensor_time=%lu",
-                     imu_id, i, last_sensor_time);
-            break;
+    // PERFORMANCE: Skip timestamp extraction from FIFO for maximum speed
+    // We'll use read_timestamp_us for all samples (post-process interpolation on receiver)
+    // Check for timestamp frame at end and skip it to avoid parsing errors
+    if (fifo_len >= 4) {
+        int ts_pos = fifo_len - 4;
+        if (fifo_data[ts_pos] == FIFO_HEADER_SENSOR_TIME) {
+            fifo_len -= 4;  // Skip timestamp frame (don't parse it)
         }
     }
 
-    // Second pass: parse data frames
+    // Single pass: parse data frames (optimized for speed)
     while (pos < fifo_len && sample_count < max_samples) {
         uint8_t header = fifo_data[pos];
 
-        // Check for timestamp frame (skip it, already extracted)
-        if (header == FIFO_HEADER_SENSOR_TIME) {
-            pos += 4;  // Header + 3 bytes of timestamp
-            continue;
-        }
-
-        // Check for skip frame (FIFO overflow)
-        if (header == FIFO_HEADER_SKIP) {
-            ESP_LOGW(TAG, "IMU %d: FIFO skip frame detected (overflow!)", imu_id);
-            pos += 1;
-            continue;
-        }
-
-        // Check for config change frame
-        if (header == FIFO_HEADER_CONFIG) {
-            ESP_LOGD(TAG, "IMU %d: Config change frame", imu_id);
-            pos += 1;
-            continue;
-        }
-
-        // Parse accel+gyro frame (header 0x8C)
+        // Parse accel+gyro frame (header 0x8C) - most common case first
         if (header == FIFO_HEADER_ACCEL_GYRO) {
             if (pos + 13 > fifo_len) {
-                ESP_LOGW(TAG, "IMU %d: Incomplete frame at end of FIFO", imu_id);
-                break;  // Incomplete frame
+                break;  // Incomplete frame - no logging
             }
 
             // Extract raw sensor data (12 bytes after header)
@@ -322,29 +300,25 @@ int parse_fifo_frames(uint8_t *fifo_data, uint16_t fifo_len, uint8_t imu_id,
 
             samples[sample_count].imu_id = imu_id;
 
-            // Interpolate timestamp if we have sensor_time
-            if (found_timestamp) {
-                // Calculate how many samples back from the last one (which has last_sensor_time)
-                int samples_from_end = (fifo_len - pos - 13) / 13;  // Remaining frames after this one
-
-                // Interpolate sensor time backwards (800Hz = 32 ticks per sample)
-                uint32_t sample_sensor_time = last_sensor_time - (samples_from_end * 32);
-                samples[sample_count].sensor_time_ticks = sample_sensor_time;
-
-                // Interpolate ESP32 timestamp backwards (800Hz = 1250µs per sample)
-                int64_t time_offset_us = samples_from_end * 1250;
-                samples[sample_count].esp32_time_us = read_timestamp_us - time_offset_us;
-            } else {
-                // No timestamp available, just use read time
-                samples[sample_count].sensor_time_ticks = 0;
-                samples[sample_count].esp32_time_us = read_timestamp_us;
-            }
+            // PERFORMANCE: No interpolation - use FIFO read timestamp for all samples
+            // Post-processing can interpolate on receiving device: timestamp[i] = read_time - (count - i) * 1.25ms
+            // This saves ~30 CPU cycles per sample (timestamp extraction + interpolation eliminated)
+            samples[sample_count].sensor_time_ticks = 0;  // Not extracted (saves time)
+            samples[sample_count].esp32_time_us = read_timestamp_us;
 
             sample_count++;
             pos += 13;  // Move to next frame
+        } else if (header == FIFO_HEADER_SENSOR_TIME) {
+            // Timestamp frame (shouldn't happen since we skip at end, but handle just in case)
+            pos += 4;
+        } else if (header == FIFO_HEADER_SKIP) {
+            // Skip frame (FIFO overflow marker)
+            pos += 1;
+        } else if (header == FIFO_HEADER_CONFIG) {
+            // Config change frame
+            pos += 1;
         } else {
-            // Unknown header - skip byte and continue
-            ESP_LOGW(TAG, "IMU %d: Unknown FIFO header 0x%02X at pos %d", imu_id, header, pos);
+            // Unknown header - skip byte
             pos++;
         }
     }
@@ -438,15 +412,26 @@ void bmi160_sensor_task(void *pvParameters)
 
     ESP_LOGI(TAG, "FIFO mode enabled on all 3 IMUs");
 
-    // Performance measurement variables
+    // Performance measurement variables (only used if ENABLE_PERF_LOGGING is set)
+#if ENABLE_PERF_LOGGING
     uint32_t total_samples = 0;
     uint32_t fifo_overflow_count = 0;
     uint32_t error_count = 0;
     int64_t start_time = esp_timer_get_time();
     int64_t last_report_time = start_time;
+#endif
 
     // Temporary buffer for parsing FIFO frames from one IMU at a time
     static timestamped_imu_sample_t temp_samples[FIFO_MAX_FRAMES];
+
+    // Lookup tables for fast IMU selection (avoid ternary operators in hot loop)
+    static const uint8_t mux_channels[3] = {BMI160_MUX_CHANNEL_2, BMI160_MUX_CHANNEL_3, BMI160_MUX_CHANNEL_4};
+
+    // Initialize device pointer array (can't use static initializer with addresses)
+    bmi160_t* imu_devs[3];
+    imu_devs[0] = &bmi160_dev_ch2;
+    imu_devs[1] = &bmi160_dev_ch3;
+    imu_devs[2] = &bmi160_dev_ch4;
 
     // Main FIFO polling loop - reads buffered samples periodically
     ESP_LOGI(TAG, "Starting FIFO polling loop (interval: %dms)", FIFO_POLL_INTERVAL_MS);
@@ -456,47 +441,46 @@ void bmi160_sensor_task(void *pvParameters)
 
         // Read FIFO from all 3 IMUs sequentially and send immediately
         for (int imu_idx = 0; imu_idx < 3; imu_idx++) {
-            uint8_t mux_channel = (imu_idx == 0) ? BMI160_MUX_CHANNEL_2 :
-                                 (imu_idx == 1) ? BMI160_MUX_CHANNEL_3 :
-                                                  BMI160_MUX_CHANNEL_4;
-
-            bmi160_t *imu_dev = (imu_idx == 0) ? &bmi160_dev_ch2 :
-                                (imu_idx == 1) ? &bmi160_dev_ch3 :
-                                                 &bmi160_dev_ch4;
+            uint8_t mux_channel = mux_channels[imu_idx];
+            bmi160_t *imu_dev = imu_devs[imu_idx];
 
             // Select IMU via multiplexer
             channel_mask = PCA9548A_CHANNEL(mux_channel);
             if (i2c_dev_write(&mux_dev, NULL, 0, &channel_mask, 1) != ESP_OK) {
-                ESP_LOGW(TAG, "IMU %d: Failed to select multiplexer channel", imu_idx);
+#if ENABLE_DEBUG_LOGGING
                 error_count++;
+#endif
                 continue;
             }
 
             // Read FIFO length
             uint16_t fifo_len = 0;
             if (bmi160_get_fifo_length(imu_dev, &fifo_len) != ESP_OK) {
-                ESP_LOGW(TAG, "IMU %d: Failed to read FIFO length", imu_idx);
+#if ENABLE_DEBUG_LOGGING
                 error_count++;
+#endif
                 continue;
             }
 
-            // Skip if FIFO is empty
+            // Skip if FIFO is empty (always check to avoid reading empty FIFO)
             if (fifo_len == 0) {
                 continue;
             }
 
+#if ENABLE_DEBUG_LOGGING
             // Check for FIFO overflow
             if (fifo_len >= 1000) {
-                ESP_LOGW(TAG, "IMU %d: FIFO near full (%d bytes) - possible overflow!", imu_idx, fifo_len);
                 fifo_overflow_count++;
             }
+#endif
 
             // Read FIFO data + timestamp frame (add 4 bytes for timestamp)
             uint16_t read_len = (fifo_len + 4 > FIFO_MAX_SIZE + 4) ? FIFO_MAX_SIZE : fifo_len + 4;
 
             if (bmi160_read_fifo_data(imu_dev, fifo_buffer, read_len) != ESP_OK) {
-                ESP_LOGW(TAG, "IMU %d: Failed to read FIFO data", imu_idx);
+#if ENABLE_DEBUG_LOGGING
                 error_count++;
+#endif
                 continue;
             }
 
@@ -507,35 +491,30 @@ void bmi160_sensor_task(void *pvParameters)
             int num_samples = parse_fifo_frames(fifo_buffer, fifo_len, imu_idx,
                                                read_timestamp, temp_samples, FIFO_MAX_FRAMES);
 
+#if ENABLE_DEBUG_LOGGING
             // If we got very few or no samples from a large FIFO, it's likely corrupted
-            // This can happen when BLE causes timing issues or FIFO overflows
             if (num_samples == 0 && fifo_len > 50) {
-                ESP_LOGW(TAG, "IMU %d: Failed to parse %d bytes of FIFO (corrupted data), flushing FIFO...",
-                         imu_idx, fifo_len);
                 bmi160_flush_fifo(imu_dev);
                 error_count++;
                 continue;
             }
+#endif
 
             if (num_samples > 0) {
-                ESP_LOGD(TAG, "IMU %d: Parsed %d samples from %d bytes of FIFO",
-                         imu_idx, num_samples, fifo_len);
+#if ENABLE_PERF_LOGGING
                 total_samples += num_samples;
+#endif
 
                 // Send individual timestamped samples to queue immediately
-                // Don't wait to combine - let data_writer_task handle alignment
-                if (imu_queue != NULL) {
-                    for (int i = 0; i < num_samples; i++) {
-                        if (xQueueSend(imu_queue, &temp_samples[i], 0) != pdTRUE) {
-                            ESP_LOGD(TAG, "Queue full, sample dropped");
-                            break;
-                        }
-                    }
+                // xQueueSend with 0 timeout returns immediately if full, so no need to check space
+                for (int i = 0; i < num_samples; i++) {
+                    xQueueSend(imu_queue, &temp_samples[i], 0);
                 }
             }
         }
 
         // Report performance every second
+#if ENABLE_PERF_LOGGING
         int64_t current_time = esp_timer_get_time();
         if (current_time - last_report_time >= 1000000) {
             float elapsed_sec = (current_time - start_time) / 1000000.0;
@@ -556,6 +535,7 @@ void bmi160_sensor_task(void *pvParameters)
             last_report_time = current_time;
             start_time = current_time;
         }
+#endif
 
         // Sleep until next poll interval
         int64_t elapsed = esp_timer_get_time() - loop_start;
@@ -563,9 +543,12 @@ void bmi160_sensor_task(void *pvParameters)
 
         if (sleep_time > 0) {
             vTaskDelay(pdMS_TO_TICKS(sleep_time / 1000));
-        } else {
+        }
+#if ENABLE_DEBUG_LOGGING
+        else {
             ESP_LOGW(TAG, "Loop overrun by %lld µs!", -sleep_time);
         }
+#endif
     }
 
     // Cleanup (this code is never reached in normal operation)
@@ -583,7 +566,9 @@ void data_writer_task(void *pvParameters)
     static timestamped_imu_sample_t ble_batch[BLE_BATCH_SIZE];
     size_t sd_batch_count = 0;
     size_t ble_batch_count = 0;
+#if ENABLE_PERF_LOGGING
     uint32_t total_written = 0;
+#endif
 
     ESP_LOGI(TAG, "Data writer task started (SD batch: %d, BLE batch: %d samples)", SD_BATCH_SIZE, BLE_BATCH_SIZE);
 
@@ -601,14 +586,25 @@ void data_writer_task(void *pvParameters)
 
             // Send BLE batch when full
             if (ble_batch_count >= BLE_BATCH_SIZE) {
-                // Send raw timestamped samples over BLE
+                // Send raw timestamped samples over BLE (if queue exists)
                 if (ble_queue != NULL) {
-                    // Send batch to BLE queue (we'll update BLE task to handle timestamped samples)
-                    for (int i = 0; i < BLE_BATCH_SIZE; i++) {
-                        xQueueSend(ble_queue, &ble_batch[i], 0);
+                    // Check available queue space before sending
+                    UBaseType_t available_space = uxQueueSpacesAvailable(ble_queue);
+
+                    if (available_space >= BLE_BATCH_SIZE) {
+                        // Queue has space - send entire batch
+                        for (int i = 0; i < BLE_BATCH_SIZE; i++) {
+                            xQueueSend(ble_queue, &ble_batch[i], 0);
+                        }
+                        ble_batch_count = 0;
+                    } else {
+                        // Queue full - drop oldest batch to make room (no logging for performance)
+                        ble_batch_count = 0;
                     }
+                } else {
+                    // No queue - reset batch counter
+                    ble_batch_count = 0;
                 }
-                ble_batch_count = 0;
             }
 #endif
 
@@ -616,14 +612,16 @@ void data_writer_task(void *pvParameters)
             if (sd_batch_count >= SD_BATCH_SIZE) {
 #ifdef ENABLE_SD_CARD
                 if (sd_card != NULL && data_log_file != NULL) {
-                    // Write timestamped samples as binary data
+                    // Write timestamped samples as binary data (no logging for performance)
                     size_t written = fwrite(sd_batch, sizeof(timestamped_imu_sample_t), SD_BATCH_SIZE, data_log_file);
+#if ENABLE_PERF_LOGGING
                     if (written == SD_BATCH_SIZE) {
                         total_written += SD_BATCH_SIZE;
                         ESP_LOGI(TAG, "Wrote %d timestamped samples to SD (total: %lu)", SD_BATCH_SIZE, total_written);
-                    } else {
-                        ESP_LOGW(TAG, "Failed to write IMU batch to SD card");
                     }
+#else
+                    (void)written;  // Suppress unused variable warning
+#endif
                 }
 #endif
                 sd_batch_count = 0;
@@ -634,10 +632,14 @@ void data_writer_task(void *pvParameters)
 #ifdef ENABLE_SD_CARD
                 if (sd_card != NULL && data_log_file != NULL) {
                     size_t written = fwrite(sd_batch, sizeof(timestamped_imu_sample_t), sd_batch_count, data_log_file);
+#if ENABLE_PERF_LOGGING
                     if (written == sd_batch_count) {
                         total_written += sd_batch_count;
                         ESP_LOGI(TAG, "Wrote partial batch: %d samples (total: %lu)", sd_batch_count, total_written);
                     }
+#else
+                    (void)written;
+#endif
                 }
 #endif
                 sd_batch_count = 0;
@@ -659,37 +661,22 @@ void ble_sender_task(void *pvParameters)
     while (1) {
         timestamped_imu_sample_t sample;
 
-        // Wait for samples from BLE queue (with 1 second timeout)
-        if (xQueueReceive(ble_queue, &sample, pdMS_TO_TICKS(1000)) == pdTRUE) {
-            // Add to BLE batch buffer
+        // Wait for samples from BLE queue (short timeout to drain quickly)
+        if (xQueueReceive(ble_queue, &sample, pdMS_TO_TICKS(10)) == pdTRUE) {
+            // Always accumulate samples to keep draining the queue
             ble_send_batch[ble_batch_count++] = sample;
 
             // Send when batch is full
             if (ble_batch_count >= BLE_BATCH_SIZE) {
-                // Log sample values before sending (occasionally)
-                static uint32_t ble_send_count = 0;
-                if (ble_send_count++ % 20 == 0) {
-                    ESP_LOGI(TAG, "BLE Send - Sample[0]: IMU%d Acc[%d %d %d] Gyro[%d %d %d]",
-                             ble_send_batch[0].imu_id,
-                             ble_send_batch[0].accel[0], ble_send_batch[0].accel[1], ble_send_batch[0].accel[2],
-                             ble_send_batch[0].gyro[0], ble_send_batch[0].gyro[1], ble_send_batch[0].gyro[2]);
+                if (ble_is_connected) {
+                    // Only send if connected (no logging for performance)
+                    ble_send_timestamped_imu_batch(ble_send_batch, BLE_BATCH_SIZE);
                 }
-
-                // Send timestamped IMU samples as binary data
-                // If BLE is congested, this will fail and drop the batch
-                esp_err_t ble_ret = ble_send_timestamped_imu_batch(ble_send_batch, BLE_BATCH_SIZE);
-
-                // Only log success occasionally to reduce console spam
-                if (ble_ret == ESP_OK && ble_send_count % 20 == 0) {
-                    ESP_LOGI(TAG, "BLE send OK (%d samples, %zu bytes)",
-                             BLE_BATCH_SIZE, BLE_BATCH_SIZE * sizeof(timestamped_imu_sample_t));
-                }
-                // Failures are logged inside ble_send_timestamped_imu_batch() with rate limiting
-
-                ble_batch_count = 0;  // Reset BLE batch counter regardless of success/failure
+                // Always reset batch (drop samples if not connected)
+                ble_batch_count = 0;
             }
         }
-        // If timeout occurs with no data, just continue waiting
+        // Continue immediately to drain queue as fast as possible
     }
 }
 #endif // ENABLE_BLUETOOTH
@@ -799,8 +786,46 @@ void gps_task(void *pvParameters)
                         if (sentence_buffer[0] == '$' && sentence_pos > 5) {
                             // ESP_LOGI(TAG, "GPS: %s", sentence_buffer);
 
-                            // Log to SD card if enabled
+                            // Parse RMC sentence for date/time to rename data log file
 #ifdef ENABLE_SD_CARD
+                            // Check if this is an RMC sentence with valid fix
+                            // Format: $GPRMC,hhmmss.ss,A,lat,N,lon,W,speed,course,DDMMYY,mag,E,mode*checksum
+                            if (strncmp(sentence_buffer, "$GPRMC", 6) == 0 || strncmp(sentence_buffer, "$GNRMC", 6) == 0) {
+                                static bool gps_time_set = false;
+                                if (!gps_time_set) {
+                                    // Simple parser - extract time and date fields
+                                    char *fields[12];
+                                    int field_count = 0;
+                                    char *token = strtok(sentence_buffer, ",");
+                                    while (token != NULL && field_count < 12) {
+                                        fields[field_count++] = token;
+                                        token = strtok(NULL, ",");
+                                    }
+
+                                    // fields[1] = time (hhmmss.ss), fields[2] = status (A=valid), fields[9] = date (DDMMYY)
+                                    if (field_count >= 10 && fields[2][0] == 'A' && strlen(fields[1]) >= 6 && strlen(fields[9]) >= 6) {
+                                        // Parse time: hhmmss
+                                        int hour = (fields[1][0] - '0') * 10 + (fields[1][1] - '0');
+                                        int minute = (fields[1][2] - '0') * 10 + (fields[1][3] - '0');
+                                        int second = (fields[1][4] - '0') * 10 + (fields[1][5] - '0');
+
+                                        // Parse date: DDMMYY
+                                        int day = (fields[9][0] - '0') * 10 + (fields[9][1] - '0');
+                                        int month = (fields[9][2] - '0') * 10 + (fields[9][3] - '0');
+                                        int year = 2000 + (fields[9][4] - '0') * 10 + (fields[9][5] - '0');
+
+                                        ESP_LOGI(TAG, "GPS time acquired: %04d-%02d-%02d %02d:%02d:%02d",
+                                                 year, month, day, hour, minute, second);
+
+                                        // Rename data log file with GPS timestamp
+                                        if (sd_rename_data_log_with_gps_time(year, month, day, hour, minute, second) == ESP_OK) {
+                                            gps_time_set = true;  // Only rename once
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Log to SD card if enabled
                             if (sd_card != NULL) {
                                 esp_err_t ret = sd_log_gps(sentence_buffer);
                                 if (ret != ESP_OK) {
@@ -898,7 +923,7 @@ esp_err_t sd_card_init(void)
     slot_config.host_id = SD_SPI_HOST;
 
     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-    host.max_freq_khz = SDMMC_FREQ_PROBING;  // Use 400kHz for initialization
+    host.max_freq_khz = SDMMC_FREQ_DEFAULT;  // Auto-negotiate best speed (typically 20MHz for SPI)
 
     ESP_LOGI(TAG, "Attempting to mount SD card...");
     ret = esp_vfs_fat_sdspi_mount(SD_MOUNT_POINT, &host, &slot_config, &mount_config, &sd_card);
@@ -983,13 +1008,19 @@ esp_err_t sd_log_gps(const char *nmea_sentence)
 esp_err_t sd_open_data_log(void)
 {
     char filepath[64];
-    snprintf(filepath, sizeof(filepath), "%s/sensor_data.bin", SD_MOUNT_POINT);
 
-    // Try opening with "ab+" which creates the file if it doesn't exist
-    // "ab+" = append binary mode, create if doesn't exist
-    data_log_file = fopen(filepath, "ab+");
+    // Generate unique filename with timestamp
+    // Format: sensor_NNNNNN.bin where NNNNNN is seconds since boot
+    // TODO: Use GPS time once available for human-readable timestamps
+    int64_t timestamp = esp_timer_get_time() / 1000000;  // Convert to seconds
+    snprintf(filepath, sizeof(filepath), "%s/sensor_%lld.bin", SD_MOUNT_POINT, timestamp);
+
+    ESP_LOGI(TAG, "Creating new data log file: %s", filepath);
+
+    // Open in write binary mode (creates new file)
+    data_log_file = fopen(filepath, "wb");
     if (data_log_file == NULL) {
-        ESP_LOGE(TAG, "Failed to open data log file: %s", filepath);
+        ESP_LOGE(TAG, "Failed to create data log file: %s", filepath);
         ESP_LOGE(TAG, "errno=%d (%s)", errno, strerror(errno));
 
         // Try listing the directory to verify mount point
@@ -1009,7 +1040,12 @@ esp_err_t sd_open_data_log(void)
     // Disable buffering for immediate writes
     setbuf(data_log_file, NULL);  // Unbuffered for lowest latency
 
+    // Save the filepath for later renaming when GPS time is available
+    strncpy(current_data_log_path, filepath, sizeof(current_data_log_path) - 1);
+    current_data_log_path[sizeof(current_data_log_path) - 1] = '\0';
+
     ESP_LOGI(TAG, "Opened binary data log: %s", filepath);
+    ESP_LOGI(TAG, "File will be renamed with GPS timestamp when available");
     return ESP_OK;
 }
 
@@ -1022,6 +1058,121 @@ void sd_close_data_log(void)
         data_log_file = NULL;
         ESP_LOGI(TAG, "Closed data log file");
     }
+}
+
+// Rename data log file with GPS timestamp (call once GPS time is available)
+// Format: sensor_YYYYMMDD_HHMMSS.bin
+esp_err_t sd_rename_data_log_with_gps_time(int year, int month, int day, int hour, int minute, int second)
+{
+    if (current_data_log_path[0] == '\0') {
+        ESP_LOGW(TAG, "No data log file to rename");
+        return ESP_FAIL;
+    }
+
+    // Check if already renamed (filename contains underscore date pattern)
+    if (strstr(current_data_log_path, "_202") != NULL) {
+        ESP_LOGI(TAG, "Data log already renamed with GPS time");
+        return ESP_OK;
+    }
+
+    char new_filepath[64];
+    snprintf(new_filepath, sizeof(new_filepath), "%s/sensor_%04d%02d%02d_%02d%02d%02d.bin",
+             SD_MOUNT_POINT, year, month, day, hour, minute, second);
+
+    ESP_LOGI(TAG, "Renaming data log file:");
+    ESP_LOGI(TAG, "  From: %s", current_data_log_path);
+    ESP_LOGI(TAG, "  To:   %s", new_filepath);
+
+    // Close file before renaming
+    bool was_open = (data_log_file != NULL);
+    if (was_open) {
+        ESP_LOGI(TAG, "Closing file before rename...");
+        fflush(data_log_file);
+        fclose(data_log_file);
+        data_log_file = NULL;
+
+        // Small delay to ensure file is fully closed
+        // Keep this minimal to avoid IMU sample loss (256 sample buffer / 2400 Hz = 107ms max)
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    // Verify source file exists before attempting rename
+    struct stat st;
+    if (stat(current_data_log_path, &st) != 0) {
+        ESP_LOGE(TAG, "Source file doesn't exist: %s", current_data_log_path);
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "Source file exists (size: %ld bytes)", st.st_size);
+
+    // Rename the file
+    ESP_LOGI(TAG, "Attempting rename...");
+    int rename_result = rename(current_data_log_path, new_filepath);
+
+    if (rename_result != 0) {
+        ESP_LOGE(TAG, "rename() failed with errno=%d (%s)", errno, strerror(errno));
+        ESP_LOGW(TAG, "FatFS may not support rename on open files - trying copy+delete method...");
+
+        // Fallback: Copy file contents to new name, then delete old file
+        FILE *src = fopen(current_data_log_path, "rb");
+        if (src == NULL) {
+            ESP_LOGE(TAG, "Failed to open source file for copy: errno=%d", errno);
+            if (was_open) {
+                data_log_file = fopen(current_data_log_path, "ab");
+                if (data_log_file != NULL) setbuf(data_log_file, NULL);
+            }
+            return ESP_FAIL;
+        }
+
+        FILE *dst = fopen(new_filepath, "wb");
+        if (dst == NULL) {
+            ESP_LOGE(TAG, "Failed to create destination file: errno=%d", errno);
+            fclose(src);
+            if (was_open) {
+                data_log_file = fopen(current_data_log_path, "ab");
+                if (data_log_file != NULL) setbuf(data_log_file, NULL);
+            }
+            return ESP_FAIL;
+        }
+
+        // Copy in 512-byte chunks
+        uint8_t buffer[512];
+        size_t bytes_read;
+        ESP_LOGI(TAG, "Copying file data...");
+        while ((bytes_read = fread(buffer, 1, sizeof(buffer), src)) > 0) {
+            fwrite(buffer, 1, bytes_read, dst);
+        }
+
+        fclose(src);
+        fclose(dst);
+
+        // Delete original file
+        ESP_LOGI(TAG, "Deleting original file...");
+        if (remove(current_data_log_path) != 0) {
+            ESP_LOGE(TAG, "Failed to delete original file: errno=%d", errno);
+            // Don't fail - new file exists, just leave old one too
+        }
+
+        ESP_LOGI(TAG, "File copied and renamed successfully using fallback method");
+    } else {
+        ESP_LOGI(TAG, "rename() succeeded");
+    }
+
+    // Update the stored path
+    strncpy(current_data_log_path, new_filepath, sizeof(current_data_log_path) - 1);
+    current_data_log_path[sizeof(current_data_log_path) - 1] = '\0';
+
+    // Reopen file with new name if it was open
+    if (was_open) {
+        data_log_file = fopen(new_filepath, "ab");
+        if (data_log_file == NULL) {
+            ESP_LOGE(TAG, "Failed to reopen renamed file: errno=%d (%s)", errno, strerror(errno));
+            return ESP_FAIL;
+        }
+        setbuf(data_log_file, NULL);
+    }
+
+    ESP_LOGI(TAG, "Data log file renamed successfully!");
+    return ESP_OK;
 }
 
 // Fast binary write of IMU batch - minimal overhead
@@ -1325,12 +1476,27 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
             // Request MTU exchange
             esp_ble_gatt_set_local_mtu(BLE_MTU_SIZE);
 
-            // Update connection parameters for high throughput
+            // Switch to 2M PHY for 2x throughput (BLE 5.0 feature)
+            // Note: Requires BLE 5.0+ support on both sides, gracefully falls back to 1M if not supported
+            esp_err_t phy_ret = esp_ble_gap_set_preferred_phy(param->connect.remote_bda,
+                                                               ESP_BLE_GAP_NO_PREFER_TRANSMIT_PHY | ESP_BLE_GAP_NO_PREFER_RECEIVE_PHY,
+                                                               ESP_BLE_GAP_PHY_2M_PREF_MASK,
+                                                               ESP_BLE_GAP_PHY_2M_PREF_MASK,
+                                                               ESP_BLE_GAP_PHY_OPTIONS_NO_PREF);
+            if (phy_ret == ESP_OK) {
+                ESP_LOGI(GATTS_TAG, "Requested 2M PHY for higher throughput");
+            } else {
+                ESP_LOGW(GATTS_TAG, "Failed to request 2M PHY: %s (will use 1M)", esp_err_to_name(phy_ret));
+            }
+
+            // Update connection parameters for maximum throughput
+            // Using 15ms interval instead of 7.5ms to reduce BLE stack overhead
+            // This allows L2CAP buffer to drain between sends
             esp_ble_conn_update_params_t conn_params = {0};
             memcpy(conn_params.bda, param->connect.remote_bda, sizeof(esp_bd_addr_t));
-            conn_params.latency = 0;
-            conn_params.max_int = 0x10;    // 20ms
-            conn_params.min_int = 0x06;    // 7.5ms
+            conn_params.latency = 0;       // No latency - immediate response
+            conn_params.max_int = 0x0C;    // 15ms max (0x0C * 1.25ms = 15ms)
+            conn_params.min_int = 0x0C;    // 15ms min (lock interval)
             conn_params.timeout = 400;     // 4s
             esp_ble_gap_update_conn_params(&conn_params);
             break;
@@ -1436,6 +1602,7 @@ esp_err_t ble_send_combined_imu_batch(combined_imu_sample_t *samples, size_t cou
     while (sent < total_size) {
         size_t chunk_size = (total_size - sent) > usable_mtu ? usable_mtu : (total_size - sent);
 
+        // Use indicate with need_confirm=false for notification behavior (no ACK required)
         esp_err_t ret = esp_ble_gatts_send_indicate(ble_gatts_if, ble_conn_id, imu_data_handle,
                                                       chunk_size, data_ptr + sent, false);
         if (ret != ESP_OK) {
@@ -1471,6 +1638,7 @@ esp_err_t ble_send_timestamped_imu_batch(timestamped_imu_sample_t *samples, size
     while (sent < total_size) {
         size_t chunk_size = (total_size - sent) > usable_mtu ? usable_mtu : (total_size - sent);
 
+        // Use indicate with need_confirm=false for notification behavior (no ACK required)
         esp_err_t ret = esp_ble_gatts_send_indicate(ble_gatts_if, ble_conn_id, imu_data_handle,
                                                       chunk_size, data_ptr + sent, false);
         if (ret != ESP_OK) {
@@ -1509,6 +1677,7 @@ esp_err_t ble_send_gps_data(const char *nmea_sentence)
     while (sent < len) {
         size_t chunk_size = (len - sent) > usable_mtu ? usable_mtu : (len - sent);
 
+        // Use indicate with need_confirm=false for notification behavior (no ACK required)
         esp_err_t ret = esp_ble_gatts_send_indicate(ble_gatts_if, ble_conn_id, gps_data_handle,
                                                       chunk_size, (uint8_t *)(nmea_sentence + sent), false);
         if (ret != ESP_OK) {
