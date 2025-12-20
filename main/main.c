@@ -4,7 +4,9 @@
 #define ENABLE_I2C_SENSORS    // Enable I2C multiplexer and BMI160 IMU
 #define ENABLE_GPS            // Enable GPS module
 #define ENABLE_SD_CARD        // Enable SD card logging
-#define ENABLE_BLUETOOTH      // Enable BLE data streaming to Android
+#define ENABLE_BLUETOOTH      // Enable BLE (control commands + optional data streaming)
+//#define ENABLE_BLE_STREAMING  // Enable BLE live data streaming (IMU/GPS) - DISABLED for performance
+#define ENABLE_WIFI_SERVER    // Enable WiFi HTTP file server for downloading logs
 
 // ============================================================================
 // Common includes
@@ -20,6 +22,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
+#include <freertos/semphr.h>
 #include "driver/gpio.h"
 
 // ============================================================================
@@ -167,12 +170,15 @@ int parse_fifo_frames(uint8_t *fifo_data, uint16_t fifo_len, uint8_t imu_id,
 static sdmmc_card_t *sd_card = NULL;
 static FILE *data_log_file = NULL;  // Single binary log file kept open for all sensor data
 static char current_data_log_path[64] = {0};  // Track current log file path for renaming
+static SemaphoreHandle_t sd_file_mutex = NULL;  // Mutex to protect data_log_file from concurrent writes
 
 // Forward declarations for SD card functions
 esp_err_t sd_card_init(void);
 void sd_card_deinit(void);
 esp_err_t sd_write_file(const char *filename, const char *data, bool append);
 esp_err_t sd_log_gps(const char *nmea_sentence);
+esp_err_t sd_write_gps_packet(const char *nmea_sentence);  // Write GPS packet to binary log
+static esp_err_t sd_write_imu_packet(const timestamped_imu_sample_t *sample);  // Write IMU packet to binary log
 esp_err_t sd_open_data_log(void);  // Open binary log file for fast writes
 void sd_close_data_log(void);      // Close and flush data log
 esp_err_t sd_rename_data_log_with_gps_time(int year, int month, int day, int hour, int minute, int second);  // Rename with GPS timestamp
@@ -196,11 +202,19 @@ esp_err_t sd_log_imu_batch(imu_sample_t *samples, size_t count);  // Fast binary
 // BLE Service and Characteristic UUIDs
 // Custom 128-bit UUIDs for our datalogger service
 #define GATTS_SERVICE_UUID_DATALOGGER   0x00FF
-#define GATTS_CHAR_UUID_IMU_DATA        0xFF01  // Combined IMU data (all 3 channels)
-#define GATTS_CHAR_UUID_GPS_DATA        0xFF02
+#define GATTS_CHAR_UUID_IMU_DATA        0xFF01  // Combined IMU data (all 3 channels) - DISABLED FOR PERFORMANCE
+#define GATTS_CHAR_UUID_GPS_DATA        0xFF02  // GPS data - DISABLED FOR PERFORMANCE
+#define GATTS_CHAR_UUID_CONTROL         0xFF03  // Control commands (WIFI_ON, WIFI_OFF, etc.) - WRITE
+#define GATTS_CHAR_UUID_STATUS          0xFF04  // Status info (WiFi state, IP address, etc.) - READ/NOTIFY
+
+// Control Commands (write to GATTS_CHAR_UUID_CONTROL)
+#define CMD_WIFI_ON                     0x01
+#define CMD_WIFI_OFF                    0x02
+#define CMD_START_LOGGING               0x03
+#define CMD_STOP_LOGGING                0x04
 
 // GATT Server Configuration
-#define GATTS_NUM_HANDLE                8  // Service + 2 characteristics + 2 CCCDs
+#define GATTS_NUM_HANDLE                12  // Service + 4 characteristics + 4 CCCDs
 #define GATTS_DEMO_CHAR_VAL_LEN_MAX     512
 #define PREPARE_BUF_MAX_SIZE            1024
 #define DEVICE_NAME                     "ESP32-Datalogger"
@@ -212,7 +226,12 @@ esp_err_t sd_log_imu_batch(imu_sample_t *samples, size_t count);  // Fast binary
 #define APP_ID                          0x55
 
 // MTU size - negotiated with client (23-512 bytes)
+// Reduced for control-only BLE (no data streaming)
+#ifdef ENABLE_BLE_STREAMING
 #define BLE_MTU_SIZE                    512
+#else
+#define BLE_MTU_SIZE                    128  // Smaller MTU for control commands only
+#endif
 
 // Global BLE state variables
 static uint16_t ble_conn_id = 0xFFFF;  // Connection ID (0xFFFF = not connected)
@@ -222,18 +241,62 @@ static uint16_t ble_mtu = 23;          // Current MTU (starts at minimum)
 static bool ble_characteristics_ready = false;  // All characteristics initialized
 
 // Characteristic handles
-static uint16_t imu_data_handle = 0;   // Combined IMU data (all 3 channels)
-static uint16_t gps_data_handle = 0;
+static uint16_t imu_data_handle = 0;   // Combined IMU data (all 3 channels) - DISABLED
+static uint16_t gps_data_handle = 0;   // GPS data - DISABLED
+static uint16_t control_handle = 0;    // Control commands (write-only)
+static uint16_t status_handle = 0;     // Status info (read/notify)
+
+// Status buffer (for BLE status characteristic) - Reduced for control-only BLE
+#define STATUS_BUFFER_SIZE 64  // Reduced from 256 - only need ~40 bytes for status string
+static char status_buffer[STATUS_BUFFER_SIZE] = "WiFi: OFF\nLogging: STOPPED\n";
 
 // Forward declarations for BLE functions
 static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param);
 static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param);
 esp_err_t ble_init(void);
-esp_err_t ble_send_combined_imu_batch(combined_imu_sample_t *samples, size_t count);
-esp_err_t ble_send_timestamped_imu_batch(timestamped_imu_sample_t *samples, size_t count);
-esp_err_t ble_send_gps_data(const char *nmea_sentence);
+esp_err_t ble_send_combined_imu_batch(combined_imu_sample_t *samples, size_t count);  // DISABLED
+esp_err_t ble_send_timestamped_imu_batch(timestamped_imu_sample_t *samples, size_t count);  // DISABLED
+esp_err_t ble_send_gps_data(const char *nmea_sentence);  // DISABLED
+void ble_update_status(void);  // Update and notify status characteristic
+void ble_handle_control_command(uint8_t cmd);  // Handle control commands
 
 #endif // ENABLE_BLUETOOTH
+
+// ============================================================================
+// WiFi HTTP Server configuration (on-demand, controlled via BLE)
+// ============================================================================
+#ifdef ENABLE_WIFI_SERVER
+#include "esp_wifi.h"
+#include "esp_mac.h"
+#include "esp_event.h"
+#include "esp_http_server.h"
+#include <dirent.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+// WiFi Configuration - Access Point mode
+#define WIFI_SSID       "ESP32-Datalogger"
+#define WIFI_PASS       "datalogger123"
+#define WIFI_CHANNEL    1
+#define MAX_STA_CONN    1
+
+static httpd_handle_t http_server = NULL;
+static bool wifi_is_running = false;
+static bool logging_is_running = false;  // Track logging state (starts disabled, waiting for BLE command)
+static const char *WIFI_TAG = "WIFI";
+
+// Forward declarations
+esp_err_t wifi_init_softap(void);
+void wifi_stop(void);
+esp_err_t start_http_server(void);
+void stop_http_server(void);
+static esp_err_t http_get_index_handler(httpd_req_t *req);
+static esp_err_t http_get_file_list_handler(httpd_req_t *req);
+static esp_err_t http_get_download_handler(httpd_req_t *req);
+static esp_err_t http_post_delete_handler(httpd_req_t *req);
+static esp_err_t http_post_upload_handler(httpd_req_t *req);
+
+#endif // ENABLE_WIFI_SERVER
 
 static const char *TAG = "DATALOGGER";
 
@@ -611,16 +674,14 @@ void data_writer_task(void *pvParameters)
             // Write SD batch when full
             if (sd_batch_count >= SD_BATCH_SIZE) {
 #ifdef ENABLE_SD_CARD
-                if (sd_card != NULL && data_log_file != NULL) {
-                    // Write timestamped samples as binary data (no logging for performance)
-                    size_t written = fwrite(sd_batch, sizeof(timestamped_imu_sample_t), SD_BATCH_SIZE, data_log_file);
-#if ENABLE_PERF_LOGGING
-                    if (written == SD_BATCH_SIZE) {
-                        total_written += SD_BATCH_SIZE;
-                        ESP_LOGI(TAG, "Wrote %d timestamped samples to SD (total: %lu)", SD_BATCH_SIZE, total_written);
+                if (logging_is_running && sd_card != NULL && data_log_file != NULL) {
+                    // Write timestamped samples as packets
+                    for (int i = 0; i < SD_BATCH_SIZE; i++) {
+                        sd_write_imu_packet(&sd_batch[i]);
                     }
-#else
-                    (void)written;  // Suppress unused variable warning
+#if ENABLE_PERF_LOGGING
+                    total_written += SD_BATCH_SIZE;
+                    ESP_LOGI(TAG, "Wrote %d IMU packets to SD (total: %lu)", SD_BATCH_SIZE, total_written);
 #endif
                 }
 #endif
@@ -630,15 +691,14 @@ void data_writer_task(void *pvParameters)
             // Timeout - write partial batch to SD if any
             if (sd_batch_count > 0) {
 #ifdef ENABLE_SD_CARD
-                if (sd_card != NULL && data_log_file != NULL) {
-                    size_t written = fwrite(sd_batch, sizeof(timestamped_imu_sample_t), sd_batch_count, data_log_file);
-#if ENABLE_PERF_LOGGING
-                    if (written == sd_batch_count) {
-                        total_written += sd_batch_count;
-                        ESP_LOGI(TAG, "Wrote partial batch: %d samples (total: %lu)", sd_batch_count, total_written);
+                if (logging_is_running && sd_card != NULL && data_log_file != NULL) {
+                    // Write timestamped samples as packets
+                    for (int i = 0; i < sd_batch_count; i++) {
+                        sd_write_imu_packet(&sd_batch[i]);
                     }
-#else
-                    (void)written;
+#if ENABLE_PERF_LOGGING
+                    total_written += sd_batch_count;
+                    ESP_LOGI(TAG, "Wrote partial batch: %d IMU packets (total: %lu)", sd_batch_count, total_written);
 #endif
                 }
 #endif
@@ -825,17 +885,17 @@ void gps_task(void *pvParameters)
                                 }
                             }
 
-                            // Log to SD card if enabled
-                            if (sd_card != NULL) {
-                                esp_err_t ret = sd_log_gps(sentence_buffer);
+                            // Log to SD card binary file if enabled and logging is running
+                            if (logging_is_running && data_log_file != NULL) {
+                                esp_err_t ret = sd_write_gps_packet(sentence_buffer);
                                 if (ret != ESP_OK) {
-                                    ESP_LOGW(TAG, "Failed to write GPS data to SD card");
+                                    ESP_LOGW(TAG, "Failed to write GPS packet to binary log");
                                 }
                             }
 #endif
 
                             // Send over BLE if enabled and connected
-#ifdef ENABLE_BLUETOOTH
+#if defined(ENABLE_BLUETOOTH) && defined(ENABLE_BLE_STREAMING)
                             esp_err_t ble_ret = ble_send_gps_data(sentence_buffer);
                             if (ble_ret != ESP_OK && ble_is_connected) {
                                 ESP_LOGW(TAG, "Failed to send GPS data over BLE");
@@ -965,6 +1025,19 @@ esp_err_t sd_card_init(void)
     ESP_LOGI(TAG, "SD card capacity: %llu MB", cardSize);
     ESP_LOGI(TAG, "");
 
+    // Create mutex for protecting file writes
+    if (sd_file_mutex == NULL) {
+        sd_file_mutex = xSemaphoreCreateMutex();
+        if (sd_file_mutex == NULL) {
+            ESP_LOGE(TAG, "Failed to create SD file mutex");
+            esp_vfs_fat_sdcard_unmount(SD_MOUNT_POINT, sd_card);
+            spi_bus_free(SD_SPI_HOST);
+            sd_card = NULL;
+            return ESP_FAIL;
+        }
+        ESP_LOGI(TAG, "SD file mutex created");
+    }
+
     return ESP_OK;
 }
 
@@ -976,6 +1049,12 @@ void sd_card_deinit(void)
         ESP_LOGI(TAG, "SD card unmounted");
         spi_bus_free(SD_SPI_HOST);
         sd_card = NULL;
+    }
+
+    // Delete mutex
+    if (sd_file_mutex != NULL) {
+        vSemaphoreDelete(sd_file_mutex);
+        sd_file_mutex = NULL;
     }
 }
 
@@ -1004,21 +1083,205 @@ esp_err_t sd_log_gps(const char *nmea_sentence)
     return sd_write_file("gps_log.txt", nmea_sentence, true);
 }
 
+// Write GPS packet to binary data log
+// Packet format matches Android BinaryLogWriter:
+// - packet_type (uint8_t): 0x02 for GPS
+// - payload_length (uint16_t): timestamp (8) + NMEA sentence length
+// - timestamp_ms (int64_t): milliseconds since epoch
+// - nmea_sentence (char[]): NMEA sentence with newline
+esp_err_t sd_write_gps_packet(const char *nmea_sentence)
+{
+    if (data_log_file == NULL || nmea_sentence == NULL) {
+        return ESP_FAIL;
+    }
+
+    // Ensure sentence ends with newline
+    size_t sentence_len = strlen(nmea_sentence);
+    bool needs_newline = (sentence_len == 0 || nmea_sentence[sentence_len - 1] != '\n');
+    size_t total_sentence_len = sentence_len + (needs_newline ? 1 : 0);
+
+    // Calculate payload size: 8 bytes (timestamp) + sentence length
+    uint16_t payload_len = 8 + total_sentence_len;
+
+    // Get current timestamp in milliseconds
+    int64_t timestamp_ms = esp_timer_get_time() / 1000;  // Convert microseconds to milliseconds
+
+    // Lock mutex before writing to file
+    if (sd_file_mutex != NULL) {
+        xSemaphoreTake(sd_file_mutex, portMAX_DELAY);
+    }
+
+    // Write packet header
+    uint8_t packet_type = 0x02;  // GPS packet type
+    if (fwrite(&packet_type, sizeof(uint8_t), 1, data_log_file) != 1) {
+        ESP_LOGW(TAG, "Failed to write GPS packet type");
+        if (sd_file_mutex != NULL) xSemaphoreGive(sd_file_mutex);
+        return ESP_FAIL;
+    }
+    if (fwrite(&payload_len, sizeof(uint16_t), 1, data_log_file) != 1) {
+        ESP_LOGW(TAG, "Failed to write GPS payload length");
+        if (sd_file_mutex != NULL) xSemaphoreGive(sd_file_mutex);
+        return ESP_FAIL;
+    }
+
+    // Write GPS payload (timestamp + NMEA sentence)
+    if (fwrite(&timestamp_ms, sizeof(int64_t), 1, data_log_file) != 1) {
+        ESP_LOGW(TAG, "Failed to write GPS timestamp");
+        if (sd_file_mutex != NULL) xSemaphoreGive(sd_file_mutex);
+        return ESP_FAIL;
+    }
+    if (fwrite(nmea_sentence, 1, sentence_len, data_log_file) != sentence_len) {
+        ESP_LOGW(TAG, "Failed to write NMEA sentence");
+        if (sd_file_mutex != NULL) xSemaphoreGive(sd_file_mutex);
+        return ESP_FAIL;
+    }
+    if (needs_newline) {
+        char newline = '\n';
+        if (fwrite(&newline, 1, 1, data_log_file) != 1) {
+            ESP_LOGW(TAG, "Failed to write newline");
+            if (sd_file_mutex != NULL) xSemaphoreGive(sd_file_mutex);
+            return ESP_FAIL;
+        }
+    }
+
+    // Unlock mutex after writing
+    if (sd_file_mutex != NULL) {
+        xSemaphoreGive(sd_file_mutex);
+    }
+
+    // Debug: Log first few GPS packets to verify format
+    static int gps_packet_count = 0;
+    if (gps_packet_count < 3) {
+        ESP_LOGI(TAG, "GPS packet %d: type=0x%02x, len=%u, ts=%lld, nmea=%.20s...",
+                 gps_packet_count, packet_type, payload_len, timestamp_ms, nmea_sentence);
+        gps_packet_count++;
+    }
+
+    return ESP_OK;
+}
+
+// Write IMU packet to binary data log
+// Packet format matches Android BinaryLogWriter IMU packet:
+// - packet_type (uint8_t): 0x01/0x03/0x04 for IMU1/IMU2/IMU3
+// - payload_length (uint16_t): 32 bytes (8 timestamp + 6*4 sensor data)
+// - timestamp_us (int64_t): microseconds since boot
+// - accel_x/y/z (float): accelerometer data in g
+// - gyro_x/y/z (float): gyroscope data in deg/s
+static esp_err_t sd_write_imu_packet(const timestamped_imu_sample_t *sample)
+{
+    if (data_log_file == NULL || sample == NULL) {
+        return ESP_FAIL;
+    }
+
+    // Determine packet type based on IMU ID
+    uint8_t packet_type;
+    switch (sample->imu_id) {
+        case 0: packet_type = 0x01; break;  // IMU1
+        case 1: packet_type = 0x03; break;  // IMU2
+        case 2: packet_type = 0x04; break;  // IMU3
+        default:
+            ESP_LOGW(TAG, "Unknown IMU ID: %d", sample->imu_id);
+            return ESP_FAIL;
+    }
+
+    // Payload is always 32 bytes: 8 (timestamp) + 24 (6 floats * 4 bytes)
+    uint16_t payload_len = 32;
+
+    // Convert int16_t sensor values to float (same scaling as Android)
+    // BMI160 scales: 2g range = ±2g / 32768 LSB, 125dps range = ±125 deg/s / 32768 LSB
+    float accel_scale = 2.0f / 32768.0f;
+    float gyro_scale = 125.0f / 32768.0f;
+
+    float accel_x = (float)sample->accel[0] * accel_scale;
+    float accel_y = (float)sample->accel[1] * accel_scale;
+    float accel_z = (float)sample->accel[2] * accel_scale;
+    float gyro_x = (float)sample->gyro[0] * gyro_scale;
+    float gyro_y = (float)sample->gyro[1] * gyro_scale;
+    float gyro_z = (float)sample->gyro[2] * gyro_scale;
+
+    // Lock mutex before writing to file
+    if (sd_file_mutex != NULL) {
+        xSemaphoreTake(sd_file_mutex, portMAX_DELAY);
+    }
+
+    // Write packet header
+    if (fwrite(&packet_type, sizeof(uint8_t), 1, data_log_file) != 1) {
+        if (sd_file_mutex != NULL) xSemaphoreGive(sd_file_mutex);
+        return ESP_FAIL;
+    }
+    if (fwrite(&payload_len, sizeof(uint16_t), 1, data_log_file) != 1) {
+        if (sd_file_mutex != NULL) xSemaphoreGive(sd_file_mutex);
+        return ESP_FAIL;
+    }
+
+    // Write IMU payload (timestamp + sensor data as floats)
+    if (fwrite(&sample->esp32_time_us, sizeof(int64_t), 1, data_log_file) != 1) {
+        if (sd_file_mutex != NULL) xSemaphoreGive(sd_file_mutex);
+        return ESP_FAIL;
+    }
+    if (fwrite(&accel_x, sizeof(float), 1, data_log_file) != 1) {
+        if (sd_file_mutex != NULL) xSemaphoreGive(sd_file_mutex);
+        return ESP_FAIL;
+    }
+    if (fwrite(&accel_y, sizeof(float), 1, data_log_file) != 1) {
+        if (sd_file_mutex != NULL) xSemaphoreGive(sd_file_mutex);
+        return ESP_FAIL;
+    }
+    if (fwrite(&accel_z, sizeof(float), 1, data_log_file) != 1) {
+        if (sd_file_mutex != NULL) xSemaphoreGive(sd_file_mutex);
+        return ESP_FAIL;
+    }
+    if (fwrite(&gyro_x, sizeof(float), 1, data_log_file) != 1) {
+        if (sd_file_mutex != NULL) xSemaphoreGive(sd_file_mutex);
+        return ESP_FAIL;
+    }
+    if (fwrite(&gyro_y, sizeof(float), 1, data_log_file) != 1) {
+        if (sd_file_mutex != NULL) xSemaphoreGive(sd_file_mutex);
+        return ESP_FAIL;
+    }
+    if (fwrite(&gyro_z, sizeof(float), 1, data_log_file) != 1) {
+        if (sd_file_mutex != NULL) xSemaphoreGive(sd_file_mutex);
+        return ESP_FAIL;
+    }
+
+    // Unlock mutex after writing
+    if (sd_file_mutex != NULL) {
+        xSemaphoreGive(sd_file_mutex);
+    }
+
+    // Debug: Log first few packets to verify format
+    static int packet_count = 0;
+    if (packet_count < 3) {
+        ESP_LOGI(TAG, "IMU packet %d: type=0x%02x, len=%u, ts=%lld, ax=%.3f, ay=%.3f, az=%.3f",
+                 packet_count, packet_type, payload_len, sample->esp32_time_us, accel_x, accel_y, accel_z);
+        packet_count++;
+    }
+
+    return ESP_OK;
+}
+
 // Open binary data log file and keep it open for fast writes
 esp_err_t sd_open_data_log(void)
 {
+    // Check if file is already open
+    if (data_log_file != NULL) {
+        ESP_LOGW(TAG, "Data log file already open, closing it first");
+        sd_close_data_log();
+    }
+
     char filepath[64];
 
     // Generate unique filename with timestamp
     // Format: sensor_NNNNNN.bin where NNNNNN is seconds since boot
     // TODO: Use GPS time once available for human-readable timestamps
-    int64_t timestamp = esp_timer_get_time() / 1000000;  // Convert to seconds
-    snprintf(filepath, sizeof(filepath), "%s/sensor_%lld.bin", SD_MOUNT_POINT, timestamp);
+    uint32_t timestamp = (uint32_t)(esp_timer_get_time() / 1000000);  // Convert to seconds
+    snprintf(filepath, sizeof(filepath), "%s/sensor_%lu.bin", SD_MOUNT_POINT, (unsigned long)timestamp);
 
     ESP_LOGI(TAG, "Creating new data log file: %s", filepath);
 
-    // Open in write binary mode (creates new file)
-    data_log_file = fopen(filepath, "wb");
+    // Open in write mode (creates new file)
+    // Note: FatFS doesn't distinguish between text/binary, so "w" works for binary data
+    data_log_file = fopen(filepath, "w");
     if (data_log_file == NULL) {
         ESP_LOGE(TAG, "Failed to create data log file: %s", filepath);
         ESP_LOGE(TAG, "errno=%d (%s)", errno, strerror(errno));
@@ -1040,11 +1303,32 @@ esp_err_t sd_open_data_log(void)
     // Disable buffering for immediate writes
     setbuf(data_log_file, NULL);  // Unbuffered for lowest latency
 
+    // Write packet format header (matches Android BinaryLogWriter)
+    // Header: magic "ESPL" (4 bytes) + version (4 bytes) + rest zeros (120 bytes) = 128 bytes total
+    uint8_t header[128] = {0};
+    header[0] = 'E';
+    header[1] = 'S';
+    header[2] = 'P';
+    header[3] = 'L';
+    // Version = 1 (little-endian uint32)
+    header[4] = 1;
+    header[5] = 0;
+    header[6] = 0;
+    header[7] = 0;
+    // Remaining 120 bytes are zeros (reserved for future use)
+
+    if (fwrite(header, 1, sizeof(header), data_log_file) != sizeof(header)) {
+        ESP_LOGE(TAG, "Failed to write packet header");
+        fclose(data_log_file);
+        data_log_file = NULL;
+        return ESP_FAIL;
+    }
+
     // Save the filepath for later renaming when GPS time is available
     strncpy(current_data_log_path, filepath, sizeof(current_data_log_path) - 1);
     current_data_log_path[sizeof(current_data_log_path) - 1] = '\0';
 
-    ESP_LOGI(TAG, "Opened binary data log: %s", filepath);
+    ESP_LOGI(TAG, "Opened binary data log (packet format): %s", filepath);
     ESP_LOGI(TAG, "File will be renamed with GPS timestamp when available");
     return ESP_OK;
 }
@@ -1106,56 +1390,17 @@ esp_err_t sd_rename_data_log_with_gps_time(int year, int month, int day, int hou
 
     // Rename the file
     ESP_LOGI(TAG, "Attempting rename...");
-    int rename_result = rename(current_data_log_path, new_filepath);
-
-    if (rename_result != 0) {
+    if (rename(current_data_log_path, new_filepath) != 0) {
         ESP_LOGE(TAG, "rename() failed with errno=%d (%s)", errno, strerror(errno));
-        ESP_LOGW(TAG, "FatFS may not support rename on open files - trying copy+delete method...");
-
-        // Fallback: Copy file contents to new name, then delete old file
-        FILE *src = fopen(current_data_log_path, "rb");
-        if (src == NULL) {
-            ESP_LOGE(TAG, "Failed to open source file for copy: errno=%d", errno);
-            if (was_open) {
-                data_log_file = fopen(current_data_log_path, "ab");
-                if (data_log_file != NULL) setbuf(data_log_file, NULL);
-            }
-            return ESP_FAIL;
+        // Reopen original file if it was open
+        if (was_open) {
+            data_log_file = fopen(current_data_log_path, "a");
+            if (data_log_file != NULL) setbuf(data_log_file, NULL);
         }
-
-        FILE *dst = fopen(new_filepath, "wb");
-        if (dst == NULL) {
-            ESP_LOGE(TAG, "Failed to create destination file: errno=%d", errno);
-            fclose(src);
-            if (was_open) {
-                data_log_file = fopen(current_data_log_path, "ab");
-                if (data_log_file != NULL) setbuf(data_log_file, NULL);
-            }
-            return ESP_FAIL;
-        }
-
-        // Copy in 512-byte chunks
-        uint8_t buffer[512];
-        size_t bytes_read;
-        ESP_LOGI(TAG, "Copying file data...");
-        while ((bytes_read = fread(buffer, 1, sizeof(buffer), src)) > 0) {
-            fwrite(buffer, 1, bytes_read, dst);
-        }
-
-        fclose(src);
-        fclose(dst);
-
-        // Delete original file
-        ESP_LOGI(TAG, "Deleting original file...");
-        if (remove(current_data_log_path) != 0) {
-            ESP_LOGE(TAG, "Failed to delete original file: errno=%d", errno);
-            // Don't fail - new file exists, just leave old one too
-        }
-
-        ESP_LOGI(TAG, "File copied and renamed successfully using fallback method");
-    } else {
-        ESP_LOGI(TAG, "rename() succeeded");
+        return ESP_FAIL;
     }
+
+    ESP_LOGI(TAG, "rename() succeeded");
 
     // Update the stored path
     strncpy(current_data_log_path, new_filepath, sizeof(current_data_log_path) - 1);
@@ -1163,7 +1408,7 @@ esp_err_t sd_rename_data_log_with_gps_time(int year, int month, int day, int hou
 
     // Reopen file with new name if it was open
     if (was_open) {
-        data_log_file = fopen(new_filepath, "ab");
+        data_log_file = fopen(new_filepath, "a");
         if (data_log_file == NULL) {
             ESP_LOGE(TAG, "Failed to reopen renamed file: errno=%d (%s)", errno, strerror(errno));
             return ESP_FAIL;
@@ -1399,7 +1644,7 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
             // Store the characteristic handle based on UUID
             if (param->add_char.char_uuid.uuid.uuid16 == GATTS_CHAR_UUID_IMU_DATA) {
                 imu_data_handle = param->add_char.attr_handle;
-                ESP_LOGI(GATTS_TAG, "Combined IMU data handle (0xFF01): %d", imu_data_handle);
+                ESP_LOGI(GATTS_TAG, "Combined IMU data handle (0xFF01): %d [DISABLED]", imu_data_handle);
 
                 // Add CCCD (Client Characteristic Configuration Descriptor) for IMU notifications
                 esp_bt_uuid_t cccd_uuid;
@@ -1417,9 +1662,46 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
                                                &cccd_val, NULL);
             } else if (param->add_char.char_uuid.uuid.uuid16 == GATTS_CHAR_UUID_GPS_DATA) {
                 gps_data_handle = param->add_char.attr_handle;
-                ESP_LOGI(GATTS_TAG, "GPS data handle (0xFF02): %d", gps_data_handle);
+                ESP_LOGI(GATTS_TAG, "GPS data handle (0xFF02): %d [DISABLED]", gps_data_handle);
 
                 // Add CCCD for GPS notifications
+                esp_bt_uuid_t cccd_uuid;
+                cccd_uuid.len = ESP_UUID_LEN_16;
+                cccd_uuid.uuid.uuid16 = ESP_GATT_UUID_CHAR_CLIENT_CONFIG;
+
+                uint8_t cccd_init_value[2] = {0x00, 0x00};
+                esp_attr_value_t cccd_val = {
+                    .attr_max_len = sizeof(cccd_init_value),
+                    .attr_len = sizeof(cccd_init_value),
+                    .attr_value = cccd_init_value
+                };
+                esp_ble_gatts_add_char_descr(gl_profile.service_handle, &cccd_uuid,
+                                               ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
+                                               &cccd_val, NULL);
+            } else if (param->add_char.char_uuid.uuid.uuid16 == GATTS_CHAR_UUID_CONTROL) {
+                control_handle = param->add_char.attr_handle;
+                ESP_LOGI(GATTS_TAG, "Control characteristic handle (0xFF03): %d", control_handle);
+
+                // Control characteristic doesn't need CCCD (write-only, no notifications)
+                // Add a dummy descriptor to trigger next characteristic creation
+                esp_bt_uuid_t dummy_uuid;
+                dummy_uuid.len = ESP_UUID_LEN_16;
+                dummy_uuid.uuid.uuid16 = ESP_GATT_UUID_CHAR_DESCRIPTION;
+
+                const char *desc = "Control";
+                esp_attr_value_t desc_val = {
+                    .attr_max_len = strlen(desc),
+                    .attr_len = strlen(desc),
+                    .attr_value = (uint8_t *)desc
+                };
+                esp_ble_gatts_add_char_descr(gl_profile.service_handle, &dummy_uuid,
+                                               ESP_GATT_PERM_READ,
+                                               &desc_val, NULL);
+            } else if (param->add_char.char_uuid.uuid.uuid16 == GATTS_CHAR_UUID_STATUS) {
+                status_handle = param->add_char.attr_handle;
+                ESP_LOGI(GATTS_TAG, "Status characteristic handle (0xFF04): %d", status_handle);
+
+                // Add CCCD for Status notifications
                 esp_bt_uuid_t cccd_uuid;
                 cccd_uuid.len = ESP_UUID_LEN_16;
                 cccd_uuid.uuid.uuid16 = ESP_GATT_UUID_CHAR_CLIENT_CONFIG;
@@ -1453,13 +1735,53 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
                     ESP_LOGE(GATTS_TAG, "Add GPS char failed, error code=%x", add_gps_ret);
                 }
             }
-            // After GPS descriptor is added, all characteristics are ready
+            // After GPS descriptor is added, add Control characteristic
+            else if (control_handle == 0) {
+                esp_bt_uuid_t control_uuid;
+                control_uuid.len = ESP_UUID_LEN_16;
+                control_uuid.uuid.uuid16 = GATTS_CHAR_UUID_CONTROL;
+
+                esp_gatt_char_prop_t control_property = ESP_GATT_CHAR_PROP_BIT_WRITE;
+                esp_err_t add_control_ret = esp_ble_gatts_add_char(gl_profile.service_handle, &control_uuid,
+                                                                     ESP_GATT_PERM_WRITE,
+                                                                     control_property,
+                                                                     NULL, NULL);
+                if (add_control_ret) {
+                    ESP_LOGE(GATTS_TAG, "Add Control char failed, error code=%x", add_control_ret);
+                }
+            }
+            // After Control characteristic is added, add Status characteristic
+            else if (status_handle == 0) {
+                esp_bt_uuid_t status_uuid;
+                status_uuid.len = ESP_UUID_LEN_16;
+                status_uuid.uuid.uuid16 = GATTS_CHAR_UUID_STATUS;
+
+                esp_gatt_char_prop_t status_property = ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_NOTIFY;
+
+                // Set initial status value
+                esp_attr_value_t status_val = {
+                    .attr_max_len = STATUS_BUFFER_SIZE,
+                    .attr_len = strlen(status_buffer),
+                    .attr_value = (uint8_t *)status_buffer
+                };
+
+                esp_err_t add_status_ret = esp_ble_gatts_add_char(gl_profile.service_handle, &status_uuid,
+                                                                    ESP_GATT_PERM_READ,
+                                                                    status_property,
+                                                                    &status_val, NULL);
+                if (add_status_ret) {
+                    ESP_LOGE(GATTS_TAG, "Add Status char failed, error code=%x", add_status_ret);
+                }
+            }
+            // After Status descriptor is added, all characteristics are ready
             else {
                 ble_characteristics_ready = true;
                 ESP_LOGI(GATTS_TAG, "═══════════════════════════════════════");
                 ESP_LOGI(GATTS_TAG, "All BLE characteristics initialized:");
-                ESP_LOGI(GATTS_TAG, "  Combined IMU (0xFF01) handle: %d", imu_data_handle);
-                ESP_LOGI(GATTS_TAG, "  GPS (0xFF02) handle: %d", gps_data_handle);
+                ESP_LOGI(GATTS_TAG, "  Combined IMU (0xFF01) handle: %d [DISABLED]", imu_data_handle);
+                ESP_LOGI(GATTS_TAG, "  GPS (0xFF02) handle: %d [DISABLED]", gps_data_handle);
+                ESP_LOGI(GATTS_TAG, "  Control (0xFF03) handle: %d", control_handle);
+                ESP_LOGI(GATTS_TAG, "  Status (0xFF04) handle: %d", status_handle);
                 ESP_LOGI(GATTS_TAG, "═══════════════════════════════════════");
             }
             break;
@@ -1520,14 +1842,29 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
             ESP_LOGI(GATTS_TAG, "Write event: handle=%d, len=%d, is_prep=%d",
                      param->write.handle, param->write.len, param->write.is_prep);
 
+            // Send write response FIRST if needed (before processing command)
+            // This prevents race conditions with subsequent BLE operations
+            if (param->write.need_rsp) {
+                ESP_LOGI(GATTS_TAG, "Sending write response");
+                esp_ble_gatts_send_response(gatts_if, param->write.conn_id, param->write.trans_id,
+                                             ESP_GATT_OK, NULL);
+            }
+
+            // Handle Control characteristic writes (commands)
+            if (param->write.handle == control_handle && param->write.len >= 1) {
+                uint8_t cmd = param->write.value[0];
+                ESP_LOGI(GATTS_TAG, "Received control command: 0x%02X", cmd);
+                ble_handle_control_command(cmd);
+            }
             // Handle CCCD writes (client enabling/disabling notifications)
-            if (param->write.len == 2) {
+            else if (param->write.len == 2) {
                 uint16_t descr_value = param->write.value[1] << 8 | param->write.value[0];
 
                 // Determine which characteristic this belongs to
                 const char* char_name = "UNKNOWN";
                 if (param->write.handle == imu_data_handle + 1) char_name = "Combined IMU (0xFF01)";
                 else if (param->write.handle == gps_data_handle + 1) char_name = "GPS (0xFF02)";
+                else if (param->write.handle == status_handle + 1) char_name = "Status (0xFF04)";
 
                 if (descr_value == 0x0001) {
                     ESP_LOGI(GATTS_TAG, "Notifications ENABLED for %s (handle %d)", char_name, param->write.handle);
@@ -1536,13 +1873,6 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
                 } else if (descr_value == 0x0000) {
                     ESP_LOGI(GATTS_TAG, "Notifications/Indications DISABLED for %s (handle %d)", char_name, param->write.handle);
                 }
-            }
-
-            // Send write response if needed
-            if (param->write.need_rsp) {
-                ESP_LOGI(GATTS_TAG, "Sending write response");
-                esp_ble_gatts_send_response(gatts_if, param->write.conn_id, param->write.trans_id,
-                                             ESP_GATT_OK, NULL);
             }
             break;
 
@@ -1691,6 +2021,101 @@ esp_err_t ble_send_gps_data(const char *nmea_sentence)
     return ESP_OK;
 }
 
+/**
+ * @brief Update and notify BLE status characteristic
+ * Called when WiFi state or logging state changes
+ */
+void ble_update_status(void) {
+#ifdef ENABLE_WIFI_SERVER
+    snprintf(status_buffer, STATUS_BUFFER_SIZE,
+             "WiFi: %s\nLogging: %s\n",
+             wifi_is_running ? "ON" : "OFF",
+             logging_is_running ? "RUNNING" : "STOPPED");
+#else
+    snprintf(status_buffer, STATUS_BUFFER_SIZE,
+             "WiFi: DISABLED\nLogging: %s\n",
+             logging_is_running ? "RUNNING" : "STOPPED");
+#endif
+
+    ESP_LOGI(GATTS_TAG, "Status updated: %s", status_buffer);
+
+    // Send notification if connected and status characteristic is ready
+    if (ble_is_connected && ble_characteristics_ready && status_handle != 0) {
+        esp_ble_gatts_send_indicate(ble_gatts_if, ble_conn_id, status_handle,
+                                      strlen(status_buffer), (uint8_t *)status_buffer, false);
+    }
+}
+
+/**
+ * @brief Handle control commands from BLE client
+ */
+void ble_handle_control_command(uint8_t cmd) {
+    switch (cmd) {
+#ifdef ENABLE_WIFI_SERVER
+        case CMD_WIFI_ON:
+            ESP_LOGI(GATTS_TAG, "Command: WIFI_ON");
+            if (!wifi_is_running) {
+                wifi_init_softap();
+                start_http_server();
+            } else {
+                ESP_LOGW(GATTS_TAG, "WiFi already running");
+            }
+            ble_update_status();  // Always send status update
+            break;
+
+        case CMD_WIFI_OFF:
+            ESP_LOGI(GATTS_TAG, "Command: WIFI_OFF");
+            if (wifi_is_running) {
+                stop_http_server();
+                wifi_stop();
+            } else {
+                ESP_LOGW(GATTS_TAG, "WiFi already stopped");
+            }
+            ble_update_status();  // Always send status update
+            break;
+#endif
+
+        case CMD_START_LOGGING:
+            ESP_LOGI(GATTS_TAG, "Command: START_LOGGING");
+            if (!logging_is_running) {
+                logging_is_running = true;
+#ifdef ENABLE_SD_CARD
+                if (sd_card != NULL) {
+                    esp_err_t ret = sd_open_data_log();
+                    if (ret == ESP_OK) {
+                        ESP_LOGI(GATTS_TAG, "Data log file opened successfully");
+                    } else {
+                        ESP_LOGE(GATTS_TAG, "Failed to open data log file");
+                        logging_is_running = false;  // Revert if file open failed
+                    }
+                }
+#endif
+            } else {
+                ESP_LOGW(GATTS_TAG, "Logging already running");
+            }
+            ble_update_status();
+            break;
+
+        case CMD_STOP_LOGGING:
+            ESP_LOGI(GATTS_TAG, "Command: STOP_LOGGING");
+            if (logging_is_running) {
+                logging_is_running = false;
+#ifdef ENABLE_SD_CARD
+                sd_close_data_log();
+                ESP_LOGI(GATTS_TAG, "Data log file closed");
+#endif
+            } else {
+                ESP_LOGW(GATTS_TAG, "Logging already stopped");
+            }
+            ble_update_status();
+            break;
+
+        default:
+            ESP_LOGW(GATTS_TAG, "Unknown command: 0x%02X", cmd);
+            break;
+    }
+}
+
 // Initialize BLE stack and GATT server
 esp_err_t ble_init(void)
 {
@@ -1700,8 +2125,15 @@ esp_err_t ble_init(void)
     ESP_LOGI(GATTS_TAG, "╚════════════════════════════════════════════════╝");
     ESP_LOGI(GATTS_TAG, "Device Name: %s", DEVICE_NAME);
     ESP_LOGI(GATTS_TAG, "Service UUID: 0x%04X", GATTS_SERVICE_UUID_DATALOGGER);
-    ESP_LOGI(GATTS_TAG, "Combined IMU Characteristic UUID: 0x%04X (all 3 channels)", GATTS_CHAR_UUID_IMU_DATA);
-    ESP_LOGI(GATTS_TAG, "GPS Characteristic UUID: 0x%04X", GATTS_CHAR_UUID_GPS_DATA);
+#ifdef ENABLE_BLE_STREAMING
+    ESP_LOGI(GATTS_TAG, "IMU Data Characteristic UUID: 0x%04X (streaming enabled)", GATTS_CHAR_UUID_IMU_DATA);
+    ESP_LOGI(GATTS_TAG, "GPS Data Characteristic UUID: 0x%04X (streaming enabled)", GATTS_CHAR_UUID_GPS_DATA);
+#else
+    ESP_LOGI(GATTS_TAG, "IMU Data Characteristic UUID: 0x%04X (DISABLED)", GATTS_CHAR_UUID_IMU_DATA);
+    ESP_LOGI(GATTS_TAG, "GPS Data Characteristic UUID: 0x%04X (DISABLED)", GATTS_CHAR_UUID_GPS_DATA);
+#endif
+    ESP_LOGI(GATTS_TAG, "Control Characteristic UUID: 0x%04X (WiFi/Logging control)", GATTS_CHAR_UUID_CONTROL);
+    ESP_LOGI(GATTS_TAG, "Status Characteristic UUID: 0x%04X (Read/Notify state)", GATTS_CHAR_UUID_STATUS);
     ESP_LOGI(GATTS_TAG, "");
 
     esp_err_t ret;
@@ -1800,6 +2232,387 @@ esp_err_t ble_init(void)
 #endif // ENABLE_BLUETOOTH
 
 // ============================================================================
+// WiFi HTTP SERVER CODE
+// ============================================================================
+#ifdef ENABLE_WIFI_SERVER
+
+/**
+ * @brief WiFi event handler
+ */
+static void wifi_event_handler(void* arg, esp_event_base_t event_base,
+                                int32_t event_id, void* event_data)
+{
+    if (event_id == WIFI_EVENT_AP_STACONNECTED) {
+        wifi_event_ap_staconnected_t* event = (wifi_event_ap_staconnected_t*) event_data;
+        ESP_LOGI(WIFI_TAG, "Station " MACSTR " connected, AID=%d",
+                 MAC2STR(event->mac), event->aid);
+    } else if (event_id == WIFI_EVENT_AP_STADISCONNECTED) {
+        wifi_event_ap_stadisconnected_t* event = (wifi_event_ap_stadisconnected_t*) event_data;
+        ESP_LOGI(WIFI_TAG, "Station " MACSTR " disconnected, AID=%d",
+                 MAC2STR(event->mac), event->aid);
+    }
+}
+
+/**
+ * @brief Initialize WiFi in Access Point mode
+ */
+esp_err_t wifi_init_softap(void)
+{
+    if (wifi_is_running) {
+        ESP_LOGW(WIFI_TAG, "WiFi already initialized");
+        return ESP_OK;
+    }
+
+    ESP_LOGI(WIFI_TAG, "");
+    ESP_LOGI(WIFI_TAG, "╔════════════════════════════════════════════════╗");
+    ESP_LOGI(WIFI_TAG, "║         WiFi AP INITIALIZATION                 ║");
+    ESP_LOGI(WIFI_TAG, "╚════════════════════════════════════════════════╝");
+
+    // Initialize network interface
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_ap();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                        ESP_EVENT_ANY_ID,
+                                                        &wifi_event_handler,
+                                                        NULL,
+                                                        NULL));
+
+    wifi_config_t wifi_config = {
+        .ap = {
+            .ssid = WIFI_SSID,
+            .ssid_len = strlen(WIFI_SSID),
+            .channel = WIFI_CHANNEL,
+            .password = WIFI_PASS,
+            .max_connection = MAX_STA_CONN,
+            .authmode = WIFI_AUTH_WPA2_PSK
+        },
+    };
+
+    if (strlen(WIFI_PASS) == 0) {
+        wifi_config.ap.authmode = WIFI_AUTH_OPEN;
+    }
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGI(WIFI_TAG, "WiFi AP started");
+    ESP_LOGI(WIFI_TAG, "SSID: %s", WIFI_SSID);
+    ESP_LOGI(WIFI_TAG, "Password: %s", WIFI_PASS);
+    ESP_LOGI(WIFI_TAG, "Channel: %d", WIFI_CHANNEL);
+    ESP_LOGI(WIFI_TAG, "IP Address: 192.168.4.1");
+    ESP_LOGI(WIFI_TAG, "");
+
+    wifi_is_running = true;
+    return ESP_OK;
+}
+
+/**
+ * @brief Stop WiFi
+ */
+void wifi_stop(void)
+{
+    if (!wifi_is_running) {
+        return;
+    }
+
+    ESP_LOGI(WIFI_TAG, "Stopping WiFi...");
+    ESP_ERROR_CHECK(esp_wifi_stop());
+    ESP_ERROR_CHECK(esp_wifi_deinit());
+    wifi_is_running = false;
+    ESP_LOGI(WIFI_TAG, "WiFi stopped");
+}
+
+/**
+ * @brief HTTP GET handler for index page (minimal)
+ */
+static esp_err_t http_get_index_handler(httpd_req_t *req)
+{
+    const char* html = "<html><body><h1>Datalogger</h1><a href=\"/files\">Files</a></body></html>";
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+/**
+ * @brief HTTP GET handler for file listing
+ */
+static esp_err_t http_get_file_list_handler(httpd_req_t *req)
+{
+#ifdef ENABLE_SD_CARD
+    DIR *dir = opendir("/sdcard");
+    if (!dir) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to open SD card");
+        return ESP_FAIL;
+    }
+
+    // Start minimal HTML response
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_sendstr_chunk(req, "<html><body><h1>Files</h1><ul>");
+
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_type == DT_REG) {  // Regular file
+            // Limit filename length to 64 chars for display (prevents buffer overflow warnings)
+            char filename[65];
+            strncpy(filename, entry->d_name, sizeof(filename) - 1);
+            filename[sizeof(filename) - 1] = '\0';
+
+            char filepath[80];  // "/sdcard/" + 64 chars + null
+            snprintf(filepath, sizeof(filepath), "/sdcard/%s", filename);
+
+            struct stat st;
+            if (stat(filepath, &st) == 0) {
+                char row[300];  // Sufficient for 3x 64-char filename + HTML markup
+                snprintf(row, sizeof(row),
+                    "<li>%s (%ld bytes) - <a href=\"/download?file=%s\">Download</a> | "
+                    "<a href=\"/delete?file=%s\">Delete</a></li>",
+                    filename, st.st_size, filename, filename);
+                httpd_resp_sendstr_chunk(req, row);
+            }
+        }
+    }
+    closedir(dir);
+
+    httpd_resp_sendstr_chunk(req, "</ul><a href=\"/\">Home</a></body></html>");
+    httpd_resp_sendstr_chunk(req, NULL);  // End chunked response
+
+    return ESP_OK;
+#else
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "SD card not enabled");
+    return ESP_FAIL;
+#endif
+}
+
+/**
+ * @brief HTTP GET handler for file download
+ */
+static esp_err_t http_get_download_handler(httpd_req_t *req)
+{
+#ifdef ENABLE_SD_CARD
+    char filepath[300];
+    char filename[256];
+
+    // Get filename from query string
+    size_t buf_len = httpd_req_get_url_query_len(req) + 1;
+    if (buf_len > 1) {
+        char *buf = malloc(buf_len);
+        if (httpd_req_get_url_query_str(req, buf, buf_len) == ESP_OK) {
+            if (httpd_query_key_value(buf, "file", filename, sizeof(filename)) == ESP_OK) {
+                snprintf(filepath, sizeof(filepath), "/sdcard/%s", filename);
+
+                FILE *file = fopen(filepath, "r");
+                if (file) {
+                    // Set content type and headers
+                    httpd_resp_set_type(req, "application/octet-stream");
+                    char content_disp[300];
+                    snprintf(content_disp, sizeof(content_disp), "attachment; filename=\"%s\"", filename);
+                    httpd_resp_set_hdr(req, "Content-Disposition", content_disp);
+
+                    // Send file in chunks
+                    char chunk[1024];
+                    size_t read_bytes;
+                    while ((read_bytes = fread(chunk, 1, sizeof(chunk), file)) > 0) {
+                        if (httpd_resp_send_chunk(req, chunk, read_bytes) != ESP_OK) {
+                            fclose(file);
+                            free(buf);
+                            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to send file");
+                            return ESP_FAIL;
+                        }
+                    }
+                    fclose(file);
+                    httpd_resp_send_chunk(req, NULL, 0);  // End chunked response
+                    free(buf);
+                    return ESP_OK;
+                } else {
+                    free(buf);
+                    httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "File not found");
+                    return ESP_FAIL;
+                }
+            }
+        }
+        free(buf);
+    }
+
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing filename parameter");
+    return ESP_FAIL;
+#else
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "SD card not enabled");
+    return ESP_FAIL;
+#endif
+}
+
+/**
+ * @brief HTTP GET handler for file deletion
+ */
+static esp_err_t http_post_delete_handler(httpd_req_t *req)
+{
+#ifdef ENABLE_SD_CARD
+    char filepath[300];
+    char filename[256];
+
+    // Get filename from query string
+    size_t buf_len = httpd_req_get_url_query_len(req) + 1;
+    if (buf_len > 1) {
+        char *buf = malloc(buf_len);
+        if (httpd_req_get_url_query_str(req, buf, buf_len) == ESP_OK) {
+            if (httpd_query_key_value(buf, "file", filename, sizeof(filename)) == ESP_OK) {
+                snprintf(filepath, sizeof(filepath), "/sdcard/%s", filename);
+
+                if (unlink(filepath) == 0) {
+                    ESP_LOGI(WIFI_TAG, "Deleted file: %s", filename);
+                    free(buf);
+                    httpd_resp_sendstr(req, "File deleted");
+                    return ESP_OK;
+                } else {
+                    free(buf);
+                    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to delete file");
+                    return ESP_FAIL;
+                }
+            }
+        }
+        free(buf);
+    }
+
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing filename parameter");
+    return ESP_FAIL;
+#else
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "SD card not enabled");
+    return ESP_FAIL;
+#endif
+}
+
+/**
+ * @brief HTTP POST handler for file upload
+ */
+static esp_err_t http_post_upload_handler(httpd_req_t *req)
+{
+#ifdef ENABLE_SD_CARD
+    char filepath[300] = "/sdcard/uploaded_config.txt";
+
+    FILE *file = fopen(filepath, "w");
+    if (!file) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to create file");
+        return ESP_FAIL;
+    }
+
+    char buf[1024];
+    int received;
+    int remaining = req->content_len;
+
+    while (remaining > 0) {
+        received = httpd_req_recv(req, buf, MIN(remaining, sizeof(buf)));
+        if (received <= 0) {
+            if (received == HTTPD_SOCK_ERR_TIMEOUT) {
+                continue;
+            }
+            fclose(file);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to receive file");
+            return ESP_FAIL;
+        }
+
+        fwrite(buf, 1, received, file);
+        remaining -= received;
+    }
+
+    fclose(file);
+    ESP_LOGI(WIFI_TAG, "File uploaded successfully");
+
+    httpd_resp_sendstr(req, "File uploaded successfully");
+    return ESP_OK;
+#else
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "SD card not enabled");
+    return ESP_FAIL;
+#endif
+}
+
+/**
+ * @brief Start HTTP server
+ */
+esp_err_t start_http_server(void)
+{
+    if (http_server != NULL) {
+        ESP_LOGW(WIFI_TAG, "HTTP server already running");
+        return ESP_OK;
+    }
+
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.max_uri_handlers = 8;
+    config.stack_size = 8192;
+
+    ESP_LOGI(WIFI_TAG, "Starting HTTP server on port %d", config.server_port);
+
+    if (httpd_start(&http_server, &config) == ESP_OK) {
+        // Register URI handlers
+        httpd_uri_t index_uri = {
+            .uri = "/",
+            .method = HTTP_GET,
+            .handler = http_get_index_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(http_server, &index_uri);
+
+        httpd_uri_t files_uri = {
+            .uri = "/files",
+            .method = HTTP_GET,
+            .handler = http_get_file_list_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(http_server, &files_uri);
+
+        httpd_uri_t download_uri = {
+            .uri = "/download",
+            .method = HTTP_GET,
+            .handler = http_get_download_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(http_server, &download_uri);
+
+        httpd_uri_t delete_uri = {
+            .uri = "/delete",
+            .method = HTTP_POST,
+            .handler = http_post_delete_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(http_server, &delete_uri);
+
+        httpd_uri_t upload_uri = {
+            .uri = "/upload",
+            .method = HTTP_POST,
+            .handler = http_post_upload_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(http_server, &upload_uri);
+
+        ESP_LOGI(WIFI_TAG, "HTTP server started successfully");
+        ESP_LOGI(WIFI_TAG, "Access at: http://192.168.4.1/");
+        return ESP_OK;
+    }
+
+    ESP_LOGE(WIFI_TAG, "Failed to start HTTP server");
+    return ESP_FAIL;
+}
+
+/**
+ * @brief Stop HTTP server
+ */
+void stop_http_server(void)
+{
+    if (http_server) {
+        ESP_LOGI(WIFI_TAG, "Stopping HTTP server");
+        httpd_stop(http_server);
+        http_server = NULL;
+    }
+}
+
+#endif // ENABLE_WIFI_SERVER
+
+// ============================================================================
 // MAIN APPLICATION
 // ============================================================================
 void app_main(void)
@@ -1833,9 +2646,18 @@ void app_main(void)
     ESP_LOGI(TAG, "  ✗ SD Card Logging (disabled)");
 #endif
 #ifdef ENABLE_BLUETOOTH
-    ESP_LOGI(TAG, "  ✓ Bluetooth BLE (Data Streaming)");
+    #ifdef ENABLE_BLE_STREAMING
+    ESP_LOGI(TAG, "  ✓ Bluetooth BLE (Control + Data Streaming)");
+    #else
+    ESP_LOGI(TAG, "  ✓ Bluetooth BLE (Control Only)");
+    #endif
 #else
     ESP_LOGI(TAG, "  ✗ Bluetooth BLE (disabled)");
+#endif
+#ifdef ENABLE_WIFI_SERVER
+    ESP_LOGI(TAG, "  ✓ WiFi HTTP Server (On-Demand, controlled via BLE)");
+#else
+    ESP_LOGI(TAG, "  ✗ WiFi HTTP Server (disabled)");
 #endif
     ESP_LOGI(TAG, "");
 
@@ -1848,16 +2670,13 @@ void app_main(void)
 #endif
 
     // Initialize SD card (if enabled)
+    // Note: Data log file will be opened when logging is started via BLE command
 #ifdef ENABLE_SD_CARD
     esp_err_t sd_ret = sd_card_init();
     if (sd_ret != ESP_OK) {
         ESP_LOGW(TAG, "SD card initialization failed - continuing without SD logging");
     } else {
-        // Open binary data log file and keep it open for fast writes
-        sd_ret = sd_open_data_log();
-        if (sd_ret != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to open data log file");
-        }
+        ESP_LOGI(TAG, "SD card ready - waiting for START_LOGGING command to begin recording");
     }
 #endif
 
@@ -1870,7 +2689,8 @@ void app_main(void)
         ESP_LOGI(TAG, "Created IMU queue: %d slots", IMU_QUEUE_SIZE);
 
         // Create BLE queue (separate from SD queue for decoupling)
-        #ifdef ENABLE_BLUETOOTH
+        // Only create if BLE streaming is enabled (otherwise BLE is used only for control)
+        #if defined(ENABLE_BLUETOOTH) && defined(ENABLE_BLE_STREAMING)
         ble_queue = xQueueCreate(BLE_QUEUE_SIZE, sizeof(timestamped_imu_sample_t));
         if (ble_queue == NULL) {
             ESP_LOGE(TAG, "Failed to create BLE queue");
@@ -1886,8 +2706,8 @@ void app_main(void)
         xTaskCreate(bmi160_sensor_task, "sensor_poll", configMINIMAL_STACK_SIZE * 8, NULL, 10, &sensor_task_handle);
 
         // Create low-priority data writer task (priority 3) for SD and/or BLE
-        // This task drains the IMU queue, so it's needed even if only BLE is enabled
-        #if defined(ENABLE_SD_CARD) || defined(ENABLE_BLUETOOTH)
+        // This task drains the IMU queue, so it's needed if SD card or BLE streaming is enabled
+        #if defined(ENABLE_SD_CARD) || (defined(ENABLE_BLUETOOTH) && defined(ENABLE_BLE_STREAMING))
         xTaskCreate(data_writer_task, "data_writer", configMINIMAL_STACK_SIZE * 10, NULL, 3, &sd_writer_task_handle);
         #endif
     }
