@@ -1330,6 +1330,11 @@ esp_err_t sd_open_data_log(void)
 
     ESP_LOGI(TAG, "Opened binary data log (packet format): %s", filepath);
     ESP_LOGI(TAG, "File will be renamed with GPS timestamp when available");
+
+#ifdef ENABLE_BLUETOOTH
+    ble_update_status();  // Notify BLE clients of logging state change
+#endif
+
     return ESP_OK;
 }
 
@@ -1341,6 +1346,10 @@ void sd_close_data_log(void)
         fclose(data_log_file);
         data_log_file = NULL;
         ESP_LOGI(TAG, "Closed data log file");
+
+#ifdef ENABLE_BLUETOOTH
+        ble_update_status();  // Notify BLE clients of logging state change
+#endif
     }
 }
 
@@ -2078,22 +2087,24 @@ void ble_handle_control_command(uint8_t cmd) {
         case CMD_START_LOGGING:
             ESP_LOGI(GATTS_TAG, "Command: START_LOGGING");
             if (!logging_is_running) {
-                logging_is_running = true;
 #ifdef ENABLE_SD_CARD
                 if (sd_card != NULL) {
                     esp_err_t ret = sd_open_data_log();
                     if (ret == ESP_OK) {
+                        logging_is_running = true;
                         ESP_LOGI(GATTS_TAG, "Data log file opened successfully");
+                        // ble_update_status() called automatically by sd_open_data_log()
                     } else {
                         ESP_LOGE(GATTS_TAG, "Failed to open data log file");
-                        logging_is_running = false;  // Revert if file open failed
                     }
                 }
+#else
+                logging_is_running = true;
+                ble_update_status();  // Update status if SD card disabled
 #endif
             } else {
                 ESP_LOGW(GATTS_TAG, "Logging already running");
             }
-            ble_update_status();
             break;
 
         case CMD_STOP_LOGGING:
@@ -2103,11 +2114,13 @@ void ble_handle_control_command(uint8_t cmd) {
 #ifdef ENABLE_SD_CARD
                 sd_close_data_log();
                 ESP_LOGI(GATTS_TAG, "Data log file closed");
+                // ble_update_status() called automatically by sd_close_data_log()
+#else
+                ble_update_status();  // Update status if SD card disabled
 #endif
             } else {
                 ESP_LOGW(GATTS_TAG, "Logging already stopped");
             }
-            ble_update_status();
             break;
 
         default:
@@ -2613,6 +2626,86 @@ void stop_http_server(void)
 #endif // ENABLE_WIFI_SERVER
 
 // ============================================================================
+// BUTTON CONTROL FOR LOGGING
+// ============================================================================
+
+// Button GPIO definitions
+#define BUTTON_START_LOG_GPIO  0  // D0 - Start logging button
+#define BUTTON_STOP_LOG_GPIO   1  // D1 - Stop logging button
+
+/**
+ * Button monitoring task - Simple logging control
+ * GPIO0 (D0) - Start logging
+ * GPIO1 (D1) - Stop logging
+ */
+void button_monitor_task(void *pvParameters)
+{
+    ESP_LOGI(TAG, "Button monitor task started (GPIO0=Start, GPIO1=Stop)");
+
+    // Configure buttons as inputs with pull-ups (active low)
+    gpio_config_t io_conf = {
+        .intr_type = GPIO_INTR_DISABLE,
+        .mode = GPIO_MODE_INPUT,
+        .pin_bit_mask = (1ULL << BUTTON_START_LOG_GPIO) | (1ULL << BUTTON_STOP_LOG_GPIO),
+        .pull_down_en = 0,
+        .pull_up_en = 1
+    };
+    ESP_ERROR_CHECK(gpio_config(&io_conf));
+
+    bool start_btn_prev = 1;  // Previous state (1 = not pressed due to pull-up)
+    bool stop_btn_prev = 1;
+
+    while (1) {
+        // Read button states (active low with pull-up)
+        int start_btn = gpio_get_level(BUTTON_START_LOG_GPIO);
+        int stop_btn = gpio_get_level(BUTTON_STOP_LOG_GPIO);
+
+        // Start button pressed (falling edge detection)
+        if (start_btn == 0 && start_btn_prev == 1) {
+            vTaskDelay(pdMS_TO_TICKS(20));  // Debounce
+            if (gpio_get_level(BUTTON_START_LOG_GPIO) == 0) {
+                ESP_LOGI(TAG, "START button pressed");
+
+                if (!logging_is_running) {
+                    esp_err_t ret = sd_open_data_log();
+                    if (ret == ESP_OK) {
+                        logging_is_running = true;
+                        ESP_LOGI(TAG, "✓ Logging STARTED");
+                    } else {
+                        ESP_LOGE(TAG, "Failed to start logging");
+                    }
+                } else {
+                    ESP_LOGW(TAG, "Logging already running");
+                }
+            }
+        }
+
+        // Stop button pressed (falling edge detection)
+        if (stop_btn == 0 && stop_btn_prev == 1) {
+            vTaskDelay(pdMS_TO_TICKS(20));  // Debounce
+            if (gpio_get_level(BUTTON_STOP_LOG_GPIO) == 0) {
+                ESP_LOGI(TAG, "STOP button pressed");
+
+                if (logging_is_running) {
+                    sd_close_data_log();
+                    logging_is_running = false;
+                    ESP_LOGI(TAG, "✓ Logging STOPPED");
+                } else {
+                    ESP_LOGW(TAG, "Logging not running");
+                }
+            }
+        }
+
+        // Update previous states
+        start_btn_prev = start_btn;
+        stop_btn_prev = stop_btn;
+
+        // Poll every 20ms for responsive button detection
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+// ============================================================================
 // MAIN APPLICATION
 // ============================================================================
 void app_main(void)
@@ -2716,6 +2809,16 @@ void app_main(void)
 #ifdef ENABLE_GPS
     xTaskCreate(gps_task, "gps_task", configMINIMAL_STACK_SIZE * 4, NULL, 5, NULL);
 #endif
+
+    // Create button monitoring task for logging control (priority 4)
+    xTaskCreate(button_monitor_task, "buttons", configMINIMAL_STACK_SIZE * 2, NULL, 4, NULL);
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "╔════════════════════════════════════════════════╗");
+    ESP_LOGI(TAG, "║   BUTTON CONTROLS READY                        ║");
+    ESP_LOGI(TAG, "║   GPIO0 (D0) = START LOGGING                   ║");
+    ESP_LOGI(TAG, "║   GPIO1 (D1) = STOP LOGGING                    ║");
+    ESP_LOGI(TAG, "╚════════════════════════════════════════════════╝");
+    ESP_LOGI(TAG, "");
 
 #if !defined(ENABLE_I2C_SENSORS) && !defined(ENABLE_GPS) && !defined(ENABLE_SD_CARD)
     ESP_LOGW(TAG, "No modules enabled! Enable at least one module at the top of main.c");
