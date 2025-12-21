@@ -11,3 +11,4 @@ sdkconfig.old
 /android-app/*.jks
 /android-app/.idea/
 /android-app/app/.cxx/
+nul

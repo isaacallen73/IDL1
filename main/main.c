@@ -2588,7 +2588,7 @@ esp_err_t start_http_server(void)
 
         httpd_uri_t delete_uri = {
             .uri = "/delete",
-            .method = HTTP_POST,
+            .method = HTTP_GET,
             .handler = http_post_delete_handler,
             .user_ctx = NULL
         };
@@ -2712,6 +2712,7 @@ void app_main(void)
 {
     // Reduce SPI driver log verbosity to avoid spam from SD card operations
     esp_log_level_set("spi_master", ESP_LOG_INFO);
+    esp_log_level_set("vfs_fat", ESP_LOG_INFO);
 
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "╔════════════════════════════════════════════════╗");
