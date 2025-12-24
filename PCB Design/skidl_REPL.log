@@ -1,0 +1,12 @@
+WARNING: KICAD_SYMBOL_DIR environment variable is missing, so the default KiCad symbol libraries won't be searched. @ [C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\<frozen importlib._bootstrap_external>:1026=>C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\<frozen importlib._bootstrap>:488]
+WARNING: KICAD6_SYMBOL_DIR environment variable is missing, so the default KiCad symbol libraries won't be searched. @ [C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\<frozen importlib._bootstrap_external>:1026=>C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\<frozen importlib._bootstrap>:488]
+WARNING: KICAD7_SYMBOL_DIR environment variable is missing, so the default KiCad symbol libraries won't be searched. @ [C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\<frozen importlib._bootstrap_external>:1026=>C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\<frozen importlib._bootstrap>:488]
+WARNING: KICAD8_SYMBOL_DIR environment variable is missing, so the default KiCad symbol libraries won't be searched. @ [C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\<frozen importlib._bootstrap_external>:1026=>C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\<frozen importlib._bootstrap>:488]
+WARNING: KICAD9_SYMBOL_DIR environment variable is missing, so the default KiCad symbol libraries won't be searched. @ [C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\<frozen importlib._bootstrap_external>:1026=>C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\<frozen importlib._bootstrap>:488]
+WARNING: fp-lib-table file was not found. Component footprints are not available.
+WARNING: fp-lib-table file was not found. Component footprints are not available.
+WARNING: fp-lib-table file was not found. Component footprints are not available.
+WARNING: Schematic generation is not implemented for KiCad version 9. @ [C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\output\<string>:5]
+INFO: 4 warnings found while generating schematic.
+INFO: 0 errors found while generating schematic.
+

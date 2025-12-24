@@ -1,0 +1,48 @@
+WARNING: KICAD_SYMBOL_DIR environment variable is missing, so the default KiCad symbol libraries won't be searched. @ [C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\<frozen importlib._bootstrap_external>:1026=>C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\<frozen importlib._bootstrap>:488]
+WARNING: KICAD6_SYMBOL_DIR environment variable is missing, so the default KiCad symbol libraries won't be searched. @ [C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\<frozen importlib._bootstrap_external>:1026=>C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\<frozen importlib._bootstrap>:488]
+WARNING: KICAD7_SYMBOL_DIR environment variable is missing, so the default KiCad symbol libraries won't be searched. @ [C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\<frozen importlib._bootstrap_external>:1026=>C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\<frozen importlib._bootstrap>:488]
+WARNING: KICAD8_SYMBOL_DIR environment variable is missing, so the default KiCad symbol libraries won't be searched. @ [C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\<frozen importlib._bootstrap_external>:1026=>C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\<frozen importlib._bootstrap>:488]
+WARNING: KICAD9_SYMBOL_DIR environment variable is missing, so the default KiCad symbol libraries won't be searched. @ [C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\<frozen importlib._bootstrap_external>:1026=>C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\<frozen importlib._bootstrap>:488]
+WARNING: fp-lib-table file was not found. Component footprints are not available.
+WARNING: fp-lib-table file was not found. Component footprints are not available.
+WARNING: fp-lib-table file was not found. Component footprints are not available.
+WARNING: Missing tag on Conn_01x17 instantiated at C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\generate_pcb_final.py:57.
+WARNING: Random tag tKSdmyh8OQ generated for Conn_01x17.
+WARNING: Missing tag on Conn_01x08 instantiated at C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\generate_pcb_final.py:80.
+WARNING: Random tag FuiEruMpZv generated for Conn_01x08.
+WARNING: Missing tag on Conn_01x04 instantiated at C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\generate_pcb_final.py:92.
+WARNING: Random tag jsdMOlKYgA generated for Conn_01x04.
+WARNING: Missing tag on Conn_01x06 instantiated at C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\generate_pcb_final.py:100.
+WARNING: Random tag jLW2vjJLbh generated for Conn_01x06.
+WARNING: Missing tag on C instantiated at C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\generate_pcb_final.py:112.
+WARNING: Random tag 2m1mjxzujw generated for C.
+WARNING: Missing tag on C instantiated at C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\generate_pcb_final.py:112.
+WARNING: Random tag SvepuuSEro generated for C.
+WARNING: Missing tag on C instantiated at C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\generate_pcb_final.py:112.
+WARNING: Random tag doBg9JcRYQ generated for C.
+WARNING: Missing tag on C instantiated at C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\generate_pcb_final.py:112.
+WARNING: Random tag bOenwRcpoR generated for C.
+WARNING: Missing tag on C instantiated at C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\generate_pcb_final.py:112.
+WARNING: Random tag ku1rMrRgfd generated for C.
+WARNING: Missing tag on C instantiated at C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\generate_pcb_final.py:112.
+WARNING: Random tag 3xRwZMhDuj generated for C.
+WARNING: Missing tag on C instantiated at C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\generate_pcb_final.py:112.
+WARNING: Random tag tpTOoV1KVv generated for C.
+WARNING: Missing tag on R instantiated at C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\generate_pcb_final.py:118.
+WARNING: Random tag i8UN5M5uzx generated for R.
+WARNING: Missing tag on R instantiated at C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\generate_pcb_final.py:123.
+WARNING: Random tag NjPohEmCTo generated for R.
+WARNING: Missing tag on LED instantiated at C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\generate_pcb_final.py:127.
+WARNING: Random tag wQAUQnie8U generated for LED.
+WARNING: Missing tag on Conn_01x02 instantiated at C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\generate_pcb_final.py:136.
+WARNING: Random tag 4mOEQwdWg3 generated for Conn_01x02.
+WARNING: Missing tag on Conn_01x08 instantiated at C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\generate_pcb_final.py:142.
+WARNING: Random tag 7WUWnYSai0 generated for Conn_01x08.
+WARNING: Missing tag on Conn_01x08 instantiated at C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\generate_pcb_final.py:154.
+WARNING: Random tag fMvkobLRf1 generated for Conn_01x08.
+WARNING: Missing tag on Conn_01x04 instantiated at C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\generate_pcb_final.py:166.
+WARNING: Random tag Bnis4VSCja generated for Conn_01x04.
+WARNING: Missing tag on  instantiated at C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\<frozen importlib._bootstrap>:488.
+INFO: 40 warnings found while generating netlist.
+INFO: 0 errors found while generating netlist.
+

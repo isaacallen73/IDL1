@@ -19,6 +19,8 @@
 #include <esp_log.h>
 #include <esp_system.h>
 #include <esp_timer.h>
+#include <nvs_flash.h>
+#include <nvs.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
@@ -128,6 +130,41 @@ int parse_fifo_frames(uint8_t *fifo_data, uint16_t fifo_len, uint8_t imu_id,
                       int64_t read_timestamp_us, timestamped_imu_sample_t *samples,
                       int max_samples);
 
+// ============================================================================
+// IMU Calibration Data Structures
+// ============================================================================
+
+// Calibration data for a single IMU (bias/offset values)
+typedef struct __attribute__((packed)) {
+    float accel_bias[3];  // Accelerometer bias (X, Y, Z) in g
+    float gyro_bias[3];   // Gyroscope bias (X, Y, Z) in dps
+} imu_calibration_t;
+
+// Calibration data for all 3 IMUs
+typedef struct __attribute__((packed)) {
+    imu_calibration_t imu2;  // Calibration for IMU on channel 2
+    imu_calibration_t imu3;  // Calibration for IMU on channel 3
+    imu_calibration_t imu4;  // Calibration for IMU on channel 4
+    uint32_t timestamp;      // Seconds since boot when calibration was performed
+    uint8_t valid;           // 0xA5 = valid calibration data, 0x00 = not calibrated
+} all_imu_calibration_t;
+
+// Global calibration data
+static all_imu_calibration_t g_imu_calibration = {0};
+
+// Global IMU device handles (needed for calibration access)
+static bmi160_t bmi160_dev_ch2, bmi160_dev_ch3, bmi160_dev_ch4;
+static i2c_dev_t mux_dev;
+
+// NVS namespace for calibration storage
+#define NVS_NAMESPACE "datalogger"
+#define NVS_KEY_CALIBRATION "imu_cal"
+
+// Forward declarations for calibration functions
+esp_err_t save_calibration_to_nvs(all_imu_calibration_t *cal_data);
+esp_err_t load_calibration_from_nvs(all_imu_calibration_t *cal_data);
+esp_err_t perform_imu_calibration(void);
+
 #endif
 
 // ============================================================================
@@ -212,6 +249,7 @@ esp_err_t sd_log_imu_batch(imu_sample_t *samples, size_t count);  // Fast binary
 #define CMD_WIFI_OFF                    0x02
 #define CMD_START_LOGGING               0x03
 #define CMD_STOP_LOGGING                0x04
+#define CMD_CALIBRATE_IMU               0x05  // Trigger IMU calibration
 
 // GATT Server Configuration
 #define GATTS_NUM_HANDLE                12  // Service + 4 characteristics + 4 CCCDs
@@ -396,8 +434,7 @@ void bmi160_sensor_task(void *pvParameters)
     ESP_ERROR_CHECK(i2cdev_init());
     ESP_LOGI(TAG, "I2C initialized on SDA=GPIO%d, SCL=GPIO%d", I2C_MASTER_SDA_IO, I2C_MASTER_SCL_IO);
 
-    // Initialize PCA9548A multiplexer
-    i2c_dev_t mux_dev;
+    // Initialize PCA9548A multiplexer (using global mux_dev)
     memset(&mux_dev, 0, sizeof(i2c_dev_t));
     ESP_ERROR_CHECK(i2c_dev_create_mutex(&mux_dev));
     mux_dev.port = I2C_PORT;
@@ -405,16 +442,15 @@ void bmi160_sensor_task(void *pvParameters)
     mux_dev.cfg.sda_io_num = I2C_MASTER_SDA_IO;
     mux_dev.cfg.scl_io_num = I2C_MASTER_SCL_IO;
 
-    // Initialize all 3 BMI160 sensors
-    bmi160_t bmi160_dev_ch2, bmi160_dev_ch3, bmi160_dev_ch4;
+    // Initialize all 3 BMI160 sensors (using global device handles)
 
     // Configuration for all IMUs - set to 800Hz for stable data
     bmi160_conf_t bmi160_conf = {
-        .accRange = BMI160_ACC_RANGE_2G,
+        .accRange = BMI160_ACC_RANGE_16G,
         .accOdr = BMI160_ACC_ODR_800HZ,  // 800Hz for stable data
         .accAvg = BMI160_ACC_LP_AVG_2,
         .accMode = BMI160_PMU_ACC_NORMAL,
-        .gyrRange = BMI160_GYR_RANGE_125DPS,
+        .gyrRange = BMI160_GYR_RANGE_1000DPS,
         .gyrOdr = BMI160_GYR_ODR_800HZ,  // 800Hz for stable data
         .gyrMode = BMI160_PMU_GYR_NORMAL,
         .accUs = 0u
@@ -430,7 +466,7 @@ void bmi160_sensor_task(void *pvParameters)
     ESP_ERROR_CHECK(bmi160_init(&bmi160_dev_ch2, BMI160_ADDR, I2C_PORT, I2C_MASTER_SDA_IO, I2C_MASTER_SCL_IO));
     ESP_ERROR_CHECK(bmi160_self_test(&bmi160_dev_ch2));
     ESP_ERROR_CHECK(bmi160_start(&bmi160_dev_ch2, &bmi160_conf));
-    ESP_ERROR_CHECK(bmi160_calibrate(&bmi160_dev_ch2));
+    // ESP_ERROR_CHECK(bmi160_calibrate(&bmi160_dev_ch2));  // Manual calibration via BLE command instead
 
     // Initialize BMI160 on channel 3
     ESP_LOGI(TAG, "Enabling PCA9548A channel %d for BMI160 #2", BMI160_MUX_CHANNEL_3);
@@ -442,7 +478,7 @@ void bmi160_sensor_task(void *pvParameters)
     ESP_ERROR_CHECK(bmi160_init(&bmi160_dev_ch3, BMI160_ADDR, I2C_PORT, I2C_MASTER_SDA_IO, I2C_MASTER_SCL_IO));
     ESP_ERROR_CHECK(bmi160_self_test(&bmi160_dev_ch3));
     ESP_ERROR_CHECK(bmi160_start(&bmi160_dev_ch3, &bmi160_conf));
-    ESP_ERROR_CHECK(bmi160_calibrate(&bmi160_dev_ch3));
+    // ESP_ERROR_CHECK(bmi160_calibrate(&bmi160_dev_ch3));  // Manual calibration via BLE command instead
 
     // Initialize BMI160 on channel 4
     ESP_LOGI(TAG, "Enabling PCA9548A channel %d for BMI160 #3", BMI160_MUX_CHANNEL_4);
@@ -454,7 +490,7 @@ void bmi160_sensor_task(void *pvParameters)
     ESP_ERROR_CHECK(bmi160_init(&bmi160_dev_ch4, BMI160_ADDR, I2C_PORT, I2C_MASTER_SDA_IO, I2C_MASTER_SCL_IO));
     ESP_ERROR_CHECK(bmi160_self_test(&bmi160_dev_ch4));
     ESP_ERROR_CHECK(bmi160_start(&bmi160_dev_ch4, &bmi160_conf));
-    ESP_ERROR_CHECK(bmi160_calibrate(&bmi160_dev_ch4));
+    // ESP_ERROR_CHECK(bmi160_calibrate(&bmi160_dev_ch4));  // Manual calibration via BLE command instead
 
     ESP_LOGI(TAG, "All 3 BMI160 sensors initialized at 800Hz ODR");
 
@@ -741,6 +777,219 @@ void ble_sender_task(void *pvParameters)
 }
 #endif // ENABLE_BLUETOOTH
 #endif // ENABLE_SD_CARD || ENABLE_BLUETOOTH
+
+// ============================================================================
+// IMU Calibration Functions (NVS Storage)
+// ============================================================================
+
+/**
+ * @brief Save IMU calibration data to NVS (Non-Volatile Storage)
+ *
+ * @param cal_data Pointer to calibration data structure
+ * @return esp_err_t ESP_OK on success, error code otherwise
+ */
+esp_err_t save_calibration_to_nvs(all_imu_calibration_t *cal_data) {
+    nvs_handle_t nvs_handle;
+    esp_err_t err;
+
+    // Open NVS namespace
+    err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error opening NVS namespace: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    // Write calibration data as blob
+    err = nvs_set_blob(nvs_handle, NVS_KEY_CALIBRATION, cal_data, sizeof(all_imu_calibration_t));
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error writing calibration to NVS: %s", esp_err_to_name(err));
+        nvs_close(nvs_handle);
+        return err;
+    }
+
+    // Commit changes
+    err = nvs_commit(nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error committing NVS: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "Calibration data saved to NVS successfully");
+    }
+
+    nvs_close(nvs_handle);
+    return err;
+}
+
+/**
+ * @brief Load IMU calibration data from NVS
+ *
+ * @param cal_data Pointer to calibration data structure to fill
+ * @return esp_err_t ESP_OK on success, ESP_ERR_NVS_NOT_FOUND if no calibration exists
+ */
+esp_err_t load_calibration_from_nvs(all_imu_calibration_t *cal_data) {
+    nvs_handle_t nvs_handle;
+    esp_err_t err;
+
+    // Open NVS namespace
+    err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error opening NVS namespace: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    // Read calibration data blob
+    size_t required_size = sizeof(all_imu_calibration_t);
+    err = nvs_get_blob(nvs_handle, NVS_KEY_CALIBRATION, cal_data, &required_size);
+
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "No calibration data found in NVS");
+    } else if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error reading calibration from NVS: %s", esp_err_to_name(err));
+    } else if (cal_data->valid == 0xA5) {
+        ESP_LOGI(TAG, "Calibration data loaded from NVS (timestamp: %lu)", (unsigned long)cal_data->timestamp);
+    } else {
+        ESP_LOGW(TAG, "Calibration data in NVS is invalid (valid marker: 0x%02X)", cal_data->valid);
+        err = ESP_ERR_INVALID_CRC;
+    }
+
+    nvs_close(nvs_handle);
+    return err;
+}
+
+/**
+ * @brief Perform IMU calibration by reading samples directly from the queue
+ *
+ * This function collects 64 samples from each IMU while they are stationary
+ * and calculates average bias values. The sensor task continues to run and
+ * populate the queue during calibration.
+ *
+ * @return esp_err_t ESP_OK on success
+ */
+esp_err_t perform_imu_calibration(void) {
+    ESP_LOGI(TAG, "═══════════════════════════════════════");
+    ESP_LOGI(TAG, "Starting IMU calibration...");
+    ESP_LOGI(TAG, "Keep sensors STATIONARY for ~3 seconds");
+    ESP_LOGI(TAG, "═══════════════════════════════════════");
+
+    // Collect 64 samples from each IMU
+    const int target_samples = 64;
+    int64_t acc0_sum[3] = {0}, gyr0_sum[3] = {0};
+    int64_t acc1_sum[3] = {0}, gyr1_sum[3] = {0};
+    int64_t acc2_sum[3] = {0}, gyr2_sum[3] = {0};
+    int count0 = 0, count1 = 0, count2 = 0;
+
+    timestamped_imu_sample_t sample;
+    int timeout_count = 0;
+    const int max_timeouts = 100;  // 10 seconds total (100 * 100ms)
+
+    // Read samples from queue
+    while (count0 < target_samples || count1 < target_samples || count2 < target_samples) {
+        if (xQueueReceive(imu_queue, &sample, pdMS_TO_TICKS(100)) == pdTRUE) {
+            timeout_count = 0;  // Reset timeout counter on success
+
+            // Accumulate based on IMU ID
+            if (sample.imu_id == 0 && count0 < target_samples) {
+                for (int i = 0; i < 3; i++) {
+                    acc0_sum[i] += sample.accel[i];
+                    gyr0_sum[i] += sample.gyro[i];
+                }
+                count0++;
+            } else if (sample.imu_id == 1 && count1 < target_samples) {
+                for (int i = 0; i < 3; i++) {
+                    acc1_sum[i] += sample.accel[i];
+                    gyr1_sum[i] += sample.gyro[i];
+                }
+                count1++;
+            } else if (sample.imu_id == 2 && count2 < target_samples) {
+                for (int i = 0; i < 3; i++) {
+                    acc2_sum[i] += sample.accel[i];
+                    gyr2_sum[i] += sample.gyro[i];
+                }
+                count2++;
+            }
+
+            // Log progress every 16 samples
+            if ((count0 + count1 + count2) % 16 == 0) {
+                ESP_LOGI(TAG, "Progress: IMU0=%d IMU1=%d IMU2=%d (target=%d each)",
+                         count0, count1, count2, target_samples);
+            }
+        } else {
+            timeout_count++;
+            if (timeout_count >= max_timeouts) {
+                ESP_LOGE(TAG, "Calibration timeout - collected: IMU0=%d IMU1=%d IMU2=%d",
+                         count0, count1, count2);
+                return ESP_FAIL;
+            }
+        }
+    }
+
+    ESP_LOGI(TAG, "Collected %d samples from each IMU", target_samples);
+
+    // Calculate averages (convert raw int16 to float using BMI160 scaling)
+    // BMI160: ±16g range = 16.0/32768, ±1000dps range = 1000.0/32768
+    const float accel_scale = 16.0f / 32768.0f;
+    const float gyro_scale = 1000.0f / 32768.0f;
+
+    // IMU ID 0 maps to channel 2 (imu2)
+    for (int i = 0; i < 3; i++) {
+        g_imu_calibration.imu2.accel_bias[i] = (acc0_sum[i] / (float)target_samples) * accel_scale;
+        g_imu_calibration.imu2.gyro_bias[i] = (gyr0_sum[i] / (float)target_samples) * gyro_scale;
+    }
+
+    // IMU ID 1 maps to channel 3 (imu3)
+    for (int i = 0; i < 3; i++) {
+        g_imu_calibration.imu3.accel_bias[i] = (acc1_sum[i] / (float)target_samples) * accel_scale;
+        g_imu_calibration.imu3.gyro_bias[i] = (gyr1_sum[i] / (float)target_samples) * gyro_scale;
+    }
+
+    // IMU ID 2 maps to channel 4 (imu4)
+    for (int i = 0; i < 3; i++) {
+        g_imu_calibration.imu4.accel_bias[i] = (acc2_sum[i] / (float)target_samples) * accel_scale;
+        g_imu_calibration.imu4.gyro_bias[i] = (gyr2_sum[i] / (float)target_samples) * gyro_scale;
+    }
+
+    // Set timestamp and valid marker
+    g_imu_calibration.timestamp = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+    g_imu_calibration.valid = 0xA5;
+
+    // Print calibration results
+    ESP_LOGI(TAG, "═══════════════════════════════════════");
+    ESP_LOGI(TAG, "Calibration complete!");
+    ESP_LOGI(TAG, "IMU2 Accel: [%+.3f, %+.3f, %+.3f] g",
+             g_imu_calibration.imu2.accel_bias[0],
+             g_imu_calibration.imu2.accel_bias[1],
+             g_imu_calibration.imu2.accel_bias[2]);
+    ESP_LOGI(TAG, "IMU2 Gyro:  [%+.3f, %+.3f, %+.3f] dps",
+             g_imu_calibration.imu2.gyro_bias[0],
+             g_imu_calibration.imu2.gyro_bias[1],
+             g_imu_calibration.imu2.gyro_bias[2]);
+    ESP_LOGI(TAG, "IMU3 Accel: [%+.3f, %+.3f, %+.3f] g",
+             g_imu_calibration.imu3.accel_bias[0],
+             g_imu_calibration.imu3.accel_bias[1],
+             g_imu_calibration.imu3.accel_bias[2]);
+    ESP_LOGI(TAG, "IMU3 Gyro:  [%+.3f, %+.3f, %+.3f] dps",
+             g_imu_calibration.imu3.gyro_bias[0],
+             g_imu_calibration.imu3.gyro_bias[1],
+             g_imu_calibration.imu3.gyro_bias[2]);
+    ESP_LOGI(TAG, "IMU4 Accel: [%+.3f, %+.3f, %+.3f] g",
+             g_imu_calibration.imu4.accel_bias[0],
+             g_imu_calibration.imu4.accel_bias[1],
+             g_imu_calibration.imu4.accel_bias[2]);
+    ESP_LOGI(TAG, "IMU4 Gyro:  [%+.3f, %+.3f, %+.3f] dps",
+             g_imu_calibration.imu4.gyro_bias[0],
+             g_imu_calibration.imu4.gyro_bias[1],
+             g_imu_calibration.imu4.gyro_bias[2]);
+    ESP_LOGI(TAG, "═══════════════════════════════════════");
+
+    // Save to NVS
+    esp_err_t err = save_calibration_to_nvs(&g_imu_calibration);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to save calibration to NVS!");
+        return err;
+    }
+
+    ESP_LOGI(TAG, "Calibration saved to NVS");
+    return ESP_OK;
+}
 
 #endif // ENABLE_I2C_SENSORS
 
@@ -1188,9 +1437,9 @@ static esp_err_t sd_write_imu_packet(const timestamped_imu_sample_t *sample)
     uint16_t payload_len = 32;
 
     // Convert int16_t sensor values to float (same scaling as Android)
-    // BMI160 scales: 2g range = ±2g / 32768 LSB, 125dps range = ±125 deg/s / 32768 LSB
-    float accel_scale = 2.0f / 32768.0f;
-    float gyro_scale = 125.0f / 32768.0f;
+    // BMI160 scales: 16g range = ±16g / 32768 LSB, 1000dps range = ±1000 deg/s / 32768 LSB
+    float accel_scale = 16.0f / 32768.0f;
+    float gyro_scale = 1000.0f / 32768.0f;
 
     float accel_x = (float)sample->accel[0] * accel_scale;
     float accel_y = (float)sample->accel[1] * accel_scale;
@@ -1304,7 +1553,7 @@ esp_err_t sd_open_data_log(void)
     setbuf(data_log_file, NULL);  // Unbuffered for lowest latency
 
     // Write packet format header (matches Android BinaryLogWriter)
-    // Header: magic "ESPL" (4 bytes) + version (4 bytes) + rest zeros (120 bytes) = 128 bytes total
+    // Header: magic "ESPL" (4 bytes) + version (4 bytes) + calibration (77 bytes) + padding (47 bytes) = 128 bytes total
     uint8_t header[128] = {0};
     header[0] = 'E';
     header[1] = 'S';
@@ -1315,7 +1564,16 @@ esp_err_t sd_open_data_log(void)
     header[5] = 0;
     header[6] = 0;
     header[7] = 0;
-    // Remaining 120 bytes are zeros (reserved for future use)
+
+#ifdef ENABLE_I2C_SENSORS
+    // Bytes 8-84: IMU calibration data (77 bytes)
+    // Copy calibration struct directly after version
+    memcpy(&header[8], &g_imu_calibration, sizeof(all_imu_calibration_t));
+    ESP_LOGI(TAG, "Writing calibration header to .bin file (valid=%s)",
+             g_imu_calibration.valid == 0xA5 ? "YES" : "NO");
+#endif
+
+    // Remaining bytes (85-127) are zeros (padding/reserved for future use)
 
     if (fwrite(header, 1, sizeof(header), data_log_file) != sizeof(header)) {
         ESP_LOGE(TAG, "Failed to write packet header");
@@ -2123,6 +2381,20 @@ void ble_handle_control_command(uint8_t cmd) {
             }
             break;
 
+        case CMD_CALIBRATE_IMU:
+            ESP_LOGI(GATTS_TAG, "Command: CALIBRATE_IMU");
+#ifdef ENABLE_I2C_SENSORS
+            esp_err_t cal_err = perform_imu_calibration();
+            if (cal_err == ESP_OK) {
+                ESP_LOGI(GATTS_TAG, "IMU calibration completed successfully");
+            } else {
+                ESP_LOGE(GATTS_TAG, "IMU calibration failed: %s", esp_err_to_name(cal_err));
+            }
+#else
+            ESP_LOGW(GATTS_TAG, "I2C sensors not enabled - cannot calibrate");
+#endif
+            break;
+
         default:
             ESP_LOGW(GATTS_TAG, "Unknown command: 0x%02X", cmd);
             break;
@@ -2754,6 +3026,30 @@ void app_main(void)
     ESP_LOGI(TAG, "  ✗ WiFi HTTP Server (disabled)");
 #endif
     ESP_LOGI(TAG, "");
+
+    // Initialize NVS (Non-Volatile Storage) for calibration data persistence
+    ESP_LOGI(TAG, "Initializing NVS...");
+    esp_err_t nvs_ret = nvs_flash_init();
+    if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES || nvs_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        // NVS partition was truncated or is in incompatible format, erase and retry
+        ESP_LOGW(TAG, "NVS partition issue detected, erasing and reinitializing...");
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        nvs_ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(nvs_ret);
+    ESP_LOGI(TAG, "NVS initialized successfully");
+
+#ifdef ENABLE_I2C_SENSORS
+    // Load calibration data from NVS (if available)
+    esp_err_t cal_ret = load_calibration_from_nvs(&g_imu_calibration);
+    if (cal_ret == ESP_OK && g_imu_calibration.valid == 0xA5) {
+        ESP_LOGI(TAG, "IMU calibration loaded from NVS");
+    } else {
+        ESP_LOGW(TAG, "No valid calibration found - use BLE command to calibrate");
+        // Initialize with zeros
+        memset(&g_imu_calibration, 0, sizeof(all_imu_calibration_t));
+    }
+#endif
 
     // Initialize Bluetooth BLE (if enabled)
 #ifdef ENABLE_BLUETOOTH

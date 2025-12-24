@@ -1,0 +1,10 @@
+WARNING: KICAD_SYMBOL_DIR environment variable is missing, so the default KiCad symbol libraries won't be searched. @ [C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\<frozen importlib._bootstrap_external>:1026=>C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\<frozen importlib._bootstrap>:488]
+WARNING: KICAD6_SYMBOL_DIR environment variable is missing, so the default KiCad symbol libraries won't be searched. @ [C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\<frozen importlib._bootstrap_external>:1026=>C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\<frozen importlib._bootstrap>:488]
+WARNING: KICAD7_SYMBOL_DIR environment variable is missing, so the default KiCad symbol libraries won't be searched. @ [C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\<frozen importlib._bootstrap_external>:1026=>C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\<frozen importlib._bootstrap>:488]
+WARNING: KICAD8_SYMBOL_DIR environment variable is missing, so the default KiCad symbol libraries won't be searched. @ [C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\<frozen importlib._bootstrap_external>:1026=>C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\<frozen importlib._bootstrap>:488]
+WARNING: fp-lib-table file was not found. Component footprints are not available.
+WARNING: fp-lib-table file was not found. Component footprints are not available.
+WARNING: fp-lib-table file was not found. Component footprints are not available.
+ERROR: Can't open file: MCU_Module.
+ @ [C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\generate_pcb.py:475=>C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\generate_pcb.py:71]
+WARNING: Could not load KiCad schematic library "MCU_Module", falling back to backup library. @ [C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\generate_pcb.py:475=>C:\Users\isaac\Documents\Saucy\ESP\Datalogger v2\PCB Design\generate_pcb.py:71]

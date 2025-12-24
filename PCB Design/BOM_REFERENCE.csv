@@ -1,0 +1,46 @@
+Reference,Quantity,Component,Value,Footprint,Supplier,Part Number,Notes,Estimated Cost
+U1,1,XIAO ESP32-C6,-,Custom (castellated pads),Seeed,113991054,Main microcontroller,$7.00
+U2,1,BMI160,-, LGA-14 or breakout,Bosch,BMI160,On-board IMU - recommend breakout for first build,$5.00
+U3,1,NEO-6M GPS Module,-,Module,u-blox,NEO-6M,GPS module with antenna connector,$10.00
+J1,1,MicroSD Card Slot,-,microSD_HC_Hirose_DM3AT,Hirose,DM3AT-SF-PEJM5,Push-push type,$2.00
+J2,1,JST Battery Connector,2-pin,JST_PH_B2B-PH-K_1x02_P2.00mm,JST,B2B-PH-K-S,2.0mm pitch right-angle,$1.00
+J3,1,Front Connector,8-pin,Header or waterproof,TE/Molex,TBD,Waterproof recommended - select based on harness design,$3.00
+J4,1,Rear Connector,8-pin,Header or waterproof,TE/Molex,TBD,Same as J3,$3.00
+J5,1,Handlebar Connector,4-pin,Header or waterproof,TE/Molex,TBD,Can use smaller connector,$2.00
+C1,1,Capacitor,10µF,0805,Murata/Samsung,GRM21BR71A106KE51L,X7R 10V+ XIAO power,$0.20
+C2,1,Capacitor,10µF,0805,Murata/Samsung,GRM21BR71A106KE51L,X7R 10V+ BMI160,$0.20
+C3,1,Capacitor,10µF,0805,Murata/Samsung,GRM21BR71A106KE51L,X7R 10V+ GPS,$0.20
+C4,1,Capacitor,10µF,0805,Murata/Samsung,GRM21BR71A106KE51L,X7R 10V+ SD card,$0.20
+C5,1,Capacitor,10µF,0805,Murata/Samsung,GRM21BR71A106KE51L,X7R 10V+ Front connector,$0.20
+C6,1,Capacitor,10µF,0805,Murata/Samsung,GRM21BR71A106KE51L,X7R 10V+ Rear connector,$0.20
+C7,1,Capacitor,10µF,0805,Murata/Samsung,GRM21BR71A106KE51L,X7R 10V+ Handlebar connector,$0.20
+R1,1,Resistor,10kΩ,0805,Yageo,RC0805FR-0710KL,1% tolerance button pull-up,$0.10
+R2,1,Resistor,1kΩ,0805,Yageo,RC0805FR-071KL,1% tolerance power LED,$0.10
+R3,1,Resistor,220Ω,0805,Yageo,RC0805FR-07220RL,1% tolerance status LED (on harness),$0.10
+D1,1,LED,Green,0805 or 3mm THT,Lite-On,LTST-C170GKT,Power indicator - green,$0.30
+ANT1,1,GPS Antenna Connector,U.FL or SMA,U.FL or SMA,Various,TBD,For external GPS antenna (optional),$2.00
+,,,,,,,Total Components:,$37.20
+,,,,,,,PCBs (5x from JLCPCB):,$25.00
+,,,,,,,Grand Total:,$62.20
+
+External Harness Components (not on main board):
+Reference,Quantity,Component,Value,Notes,Estimated Cost
+U4,1,BMI160,Breakout,Front harness IMU,$5.00
+U5,1,BMI160,Breakout,Rear harness IMU,$5.00
+SENS1,1,Pressure Sensor,Analog 0-3.3V,Front fork pressure,$15.00
+SENS2,1,Pressure Sensor,Analog 0-3.3V,Rear shock pressure,$15.00
+BTN1,1,Momentary Button,SPST NO,Power ON button,$1.00
+BTN2,1,Momentary Button,SPST NO,Power OFF button (future),$1.00
+LED2,1,LED,Any color 3mm,Status LED on handlebar,$0.50
+CABLE,3,Cable,Multi-conductor,Waterproof cable 18-22AWG,$20.00
+CONN,6,Mating Connectors,Match J3/J4/J5,Male connectors for harnesses,$10.00
+,,,,,Harness Total:,$72.50
+
+Notes:
+- All capacitors should be X7R or X5R ceramic with 10V+ rating
+- Resistors 1% tolerance 1/8W or higher
+- Consider buying extras (caps/resistors) as they're easy to lose
+- BMI160 breakout boards are easier to solder for beginners
+- GPS module typically includes antenna - external antenna optional
+- Waterproof connectors recommended for bike application (wet conditions)
+- Use marine-grade heat shrink for harness weatherproofing
